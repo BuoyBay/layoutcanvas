@@ -1,0 +1,2400 @@
+Import layoutcanvas.LayoutCanvasWheel
+Import layoutcanvas.LayoutCanvasNative
+Import editorkit
+Import layoutkit.LayoutDocument
+Import layoutkit.LayoutCatalog
+Import layoutkit.LayoutRefactor
+Import layoutkit.LayoutRelations
+
+' Design surface: painting, hit-testing, selection gestures (click, toggle,
+' marquee), move/resize with eight handles, smart guides, spacing markers,
+' keyboard handling, contextual menus, placement and the viewport.
+
+Private Class LayoutSurface Inherits LayoutWheelCanvas
+    Public Property Owner As LayoutEditor
+    Public Overrides Function NativeWheel(dx As Double, dy As Double, pixels As Boolean) As Boolean
+        If Me.Owner = Nil Then Return False
+        Return Me.Owner.StageWheel(dx, dy, pixels)
+    End Function
+    Handle Paint(g As Graphics)
+        If Me.Owner <> Nil Then Me.Owner.PaintLayout(g)
+    End Handle
+    Handle MouseDown(e As MouseEvent)
+        If Me.Owner = Nil Then Return
+        If e.Button = MouseButton.Right Then Return
+        Me.Focus()
+        Me.Owner.PointerDown(e.X, e.Y, e.ClickCount, e.Modifiers.Shift, e.Modifiers.Option, e.Modifiers.Primary, e.Button = MouseButton.Middle)
+        e.Handled = True
+    End Handle
+    Handle MouseDrag(e As MouseEvent)
+        If Me.Owner <> Nil Then Me.Owner.PointerDrag(e.X, e.Y, e.Modifiers.Shift, e.Modifiers.Option, e.Modifiers.Primary)
+    End Handle
+    Handle MouseUp(e As MouseEvent)
+        If Me.Owner = Nil Or e.Button = MouseButton.Right Then Return
+        Me.Owner.PointerDrag(e.X, e.Y, e.Modifiers.Shift, e.Modifiers.Option, e.Modifiers.Primary)
+        Me.Owner.PointerUp()
+    End Handle
+    Handle MouseMove(e As MouseEvent)
+        If Me.Owner <> Nil Then Me.Owner.PointerMove(e.X, e.Y)
+    End Handle
+    Handle MouseExit(e As MouseEvent)
+        ' No public capture API: leaving the surface safely cancels the preview.
+        If Me.Owner <> Nil Then Me.Owner.PointerExited()
+    End Handle
+    Handle KeyDown(e As KeyEvent)
+        If Me.Owner = Nil Then Return
+        If Me.Owner.KeyPressed(e.Key, e.Character, e.Modifiers.Shift, e.Modifiers.Option, e.Modifiers.Primary) Then e.Handled = True
+    End Handle
+    Handle KeyUp(e As KeyEvent)
+        If Me.Owner <> Nil Then Me.Owner.KeyReleased(e.Key)
+    End Handle
+    Handle ConstructContextualMenu(base As MenuItem, location As Point)
+        If Me.Owner <> Nil Then Me.Owner.BuildContextMenu(base, location.X, location.Y)
+    End Handle
+    Handle ContextualMenuAction(hitItem As MenuItem)
+        If Me.Owner <> Nil And hitItem <> Nil Then Me.Owner.ContextMenuChosen(hitItem.Tag)
+    End Handle
+End Class
+
+' Arrow-key nudges accumulate into one transaction, committed on key release
+' or after a short idle period.
+Private Class LayoutNudgeTimer Inherits Timer
+    Public Property Owner As LayoutEditor
+    Public Overrides Sub NotifyTick()
+        If Me.Owner <> Nil Then Me.Owner.CommitPendingNudge()
+    End Sub
+End Class
+
+Public Partial Class LayoutEditor
+    Private Property mSurface As LayoutSurface = New LayoutSurface()
+    Private Property mNudgeTimer As LayoutNudgeTimer = New LayoutNudgeTimer()
+    Private Property mZoom As Double = 1.0
+    Private Property mPanX As Double = 0.0
+    Private Property mPanY As Double = 0.0
+    Private Property mFitPending As Boolean = False
+
+    ' Move/resize gesture. The reference node supplies the public preview frame;
+    ' every other gesture node receives the same deltas.
+    Private Property mGesture As Boolean = False
+    Private Property mResize As Boolean = False
+    Private Property mHandle As Integer = -1
+    ' Native click counts belong to the whole Canvas, not an individual control.
+    Private Property mLastPointerHit As String = ""
+    Private Property mMoved As Boolean = False
+    Private Property mRefId As String = ""
+    Private Property mGestureIds As Array Of String = []
+    Private Property mOrigXs As Array Of Integer = []
+    Private Property mOrigYs As Array Of Integer = []
+    Private Property mOrigWs As Array Of Integer = []
+    Private Property mOrigHs As Array Of Integer = []
+    Private Property mPrevXs As Array Of Integer = []
+    Private Property mPrevYs As Array Of Integer = []
+    Private Property mPrevWs As Array Of Integer = []
+    Private Property mPrevHs As Array Of Integer = []
+    Private Property mStartX As Double
+    Private Property mStartY As Double
+    Private Property mStartScreenX As Double
+    Private Property mStartScreenY As Double
+    Private Property mOriginalX As Integer
+    Private Property mOriginalY As Integer
+    Private Property mOriginalW As Integer
+    Private Property mOriginalH As Integer
+    Private Property mPreviewX As Integer
+    Private Property mPreviewY As Integer
+    Private Property mPreviewW As Integer
+    Private Property mPreviewH As Integer
+    Private Property mGestureVersion As Integer
+    Private Property mMakeKeyOnRelease As String = ""
+    Private Property mDuplicateDrag As Boolean = False
+
+    ' Modifier state of the current pointer interaction.
+    Private Property mShiftDown As Boolean = False
+    Private Property mOptionDown As Boolean = False
+    Private Property mPrimaryDown As Boolean = False
+    Private Property mSpaceDown As Boolean = False
+
+    ' Marquee (rubber band) selection, canvas coordinates.
+    Private Property mMarquee As Boolean = False
+    Private Property mMarqueeAdditive As Boolean = False
+    Private Property mMarqueeBase As Array Of String = []
+    Private Property mMarqueeContainer As String = ""
+    Private Property mMarqueeX0 As Double
+    Private Property mMarqueeY0 As Double
+    Private Property mMarqueeX1 As Double
+    Private Property mMarqueeY1 As Double
+
+    ' Panning (Space-drag or middle-drag).
+    Private Property mPanning As Boolean = False
+    Private Property mPanOriginX As Double
+    Private Property mPanOriginY As Double
+
+    Private Property mPointerX As Double = -1.0
+    Private Property mPointerY As Double = -1.0
+    ' A container entered by double-click: empty clicks inside it start a marquee
+    ' among its children.
+    Private Property mFocusContainer As String = ""
+
+    ' Smart guide targets collected at gesture start (canvas coordinates).
+    Private Property mTargetsX As Array Of Double = []
+    Private Property mTargetsXFrom As Array Of Double = []
+    Private Property mTargetsXTo As Array Of Double = []
+    Private Property mTargetsY As Array Of Double = []
+    Private Property mTargetsYFrom As Array Of Double = []
+    Private Property mTargetsYTo As Array Of Double = []
+    Private Property mPeerRects As Array Of Double = []
+    Private Property mParentRect As Array Of Double = []
+    ' Active guides: orientation (0 vertical, 1 horizontal), position, from, to.
+    Private Property mGuides As Array Of Double = []
+    ' Spacing markers: x1, y1, x2, y2, distance.
+    Private Property mSpacing As Array Of Double = []
+
+    ' Pending keyboard nudge.
+    Private Property mNudgeIds As Array Of String = []
+    Private Property mNudgeDX As Integer = 0
+    Private Property mNudgeDY As Integer = 0
+    Private Property mNudgeVersion As Integer = -1
+
+    ' View toggles.
+    Private Property mShowGrid As Boolean = False
+    Private Property mSnapToGrid As Boolean = False
+    Private Property mSmartGuides As Boolean = True
+    Private Property mShowBounds As Boolean = False
+    Private Property mShowSpacing As Boolean = True
+    Private Property mGridSize As Integer = 0
+
+    ''' Snap tolerance for smart guides in screen pixels.
+    Public Property GuideTolerance As Double = 4.0
+    ''' Parent inset offered as an extra smart-guide target (layout units).
+    Public Property GuideMargin As Integer = 20
+    ''' When True, loading a document (or switching roots) fits the root into view.
+    Public Property FitOnLoad As Boolean = False
+
+    ' Opt-in relational snapping uses the same measurements as GUI lint rules.
+    ' When positive it replaces smart guides for single-control gestures.
+    Public Property RelationTolerance As Integer = 0
+
+    Public Property RelationMargins As Array Of Integer = []
+    Public Property RelationSpacing As Array Of Integer = []
+    Public Property RelationGuides As JSONItem = JSONItem.NewArray()
+    Private Property mCanvasAppearance As String = "auto"
+    Private Property mPaintDark As Boolean = False
+
+    Private Property mPlacementArmed As Boolean = False
+    Private Property mArmedType As String = ""
+    Private Property mArmedName As String = ""
+    ' Last renderer-failure message reported to the host ("" when none).
+    Private Property mRendererFailure As String = ""
+    Private Property mNativePainter As LayoutNativeControlPainter = New LayoutNativeControlPainter()
+
+    ' ---------------------------------------------------------------- properties
+
+    ''' Grid spacing in layout units (0 = default 10). Setting a size above 1
+    ''' also turns snap-to-grid on; 0 or 1 turns it off.
+    Public Property GridSize As Integer
+        Get
+            Return Me.mGridSize
+        End Get
+        Set
+            Me.mGridSize = Math.Max(0, value)
+            Me.mSnapToGrid = value > 1
+            Me.mSurface.Invalidate()
+        End Set
+    End Property
+
+    Public Property ShowGrid As Boolean
+        Get
+            Return Me.mShowGrid
+        End Get
+        Set
+            Me.mShowGrid = value
+            Me.ToggleChanged()
+        End Set
+    End Property
+
+    Public Property SnapToGrid As Boolean
+        Get
+            Return Me.mSnapToGrid
+        End Get
+        Set
+            Me.mSnapToGrid = value
+            Me.ToggleChanged()
+        End Set
+    End Property
+
+    Public Property SmartGuides As Boolean
+        Get
+            Return Me.mSmartGuides
+        End Get
+        Set
+            Me.mSmartGuides = value
+            Me.ToggleChanged()
+        End Set
+    End Property
+
+    Public Property ShowBounds As Boolean
+        Get
+            Return Me.mShowBounds
+        End Get
+        Set
+            Me.mShowBounds = value
+            Me.ToggleChanged()
+        End Set
+    End Property
+
+    Public Property ShowSpacing As Boolean
+        Get
+            Return Me.mShowSpacing
+        End Get
+        Set
+            Me.mShowSpacing = value
+            Me.ToggleChanged()
+        End Set
+    End Property
+
+    Public Property CanvasAppearance As String
+        Get
+            Return Me.mCanvasAppearance
+        End Get
+        Set
+            If value <> "auto" And value <> "light" And value <> "dark" Then Throw New InvalidArgumentException("Canvas appearance must be auto, light or dark")
+            Me.mCanvasAppearance = value
+            Me.mSurface.Invalidate()
+        End Set
+    End Property
+
+    ''' When True (default) builtin controls are drawn by the OS where supported
+    ''' (macOS, Windows and GTK4); False forces the portable canvas approximations everywhere.
+    Public Property NativeControlRendering As Boolean
+        Get
+            Return Me.mNativePainter.Enabled
+        End Get
+        Set
+            Me.mNativePainter.Enabled = value
+            Me.InvalidateNativeRendering()
+        End Set
+    End Property
+
+    ''' True when this build has OS control drawing for the design canvas.
+    Public Property NativeControlRenderingSupported As Boolean
+        Get
+            Return LayoutNativeControlPainter.Supported()
+        End Get
+    End Property
+
+    ''' Drop native bitmap and failure caches after a host-specific appearance change.
+    Public Sub InvalidateNativeRendering()
+        Me.mNativePainter.ClearCache()
+        Me.mSurface.Invalidate()
+        Me.mInspectorBackdrop.Invalidate()
+    End Sub
+
+    Public Property NativeRenderingError As String
+        Get
+            Return Me.mNativePainter.LastError
+        End Get
+    End Property
+
+    Public Property EffectiveCanvasAppearance As String
+        Get
+            If Me.mCanvasAppearance <> "auto" Then Return Me.mCanvasAppearance
+            Dim gtkTheme As String = String.LCase(System.EnvironmentVariable("GTK_THEME").Or(""))
+            If String.EndsWith(gtkTheme, ":dark") Or String.EndsWith(gtkTheme, "-dark") Then Return "dark"
+            If System.IsDarkMode Then Return "dark"
+            Return "light"
+        End Get
+    End Property
+
+    Public Property GestureActive As Boolean
+        Get
+            Return Me.mGesture
+        End Get
+    End Property
+
+    Public Property MarqueeActive As Boolean
+        Get
+            Return Me.mMarquee
+        End Get
+    End Property
+
+    ''' Number of smart-guide lines currently shown (live during gestures).
+    Public Property SmartGuideCount As Integer
+        Get
+            Return Array.Count(Me.mGuides) \ 4
+        End Get
+    End Property
+
+    ''' Number of spacing markers currently shown.
+    Public Property SpacingMarkerCount As Integer
+        Get
+            Return Array.Count(Me.mSpacing) \ 5
+        End Get
+    End Property
+
+    Public Property Zoom As Double
+        Get
+            Return Me.mZoom
+        End Get
+    End Property
+
+    Public Property PanX As Double
+        Get
+            Return Me.mPanX
+        End Get
+    End Property
+
+    Public Property PanY As Double
+        Get
+            Return Me.mPanY
+        End Get
+    End Property
+
+    Public Property PreviewX As Integer
+        Get
+            Return Me.mPreviewX
+        End Get
+    End Property
+
+    Public Property PreviewY As Integer
+        Get
+            Return Me.mPreviewY
+        End Get
+    End Property
+
+    Public Property PreviewWidth As Integer
+        Get
+            Return Me.mPreviewW
+        End Get
+    End Property
+
+    Public Property PreviewHeight As Integer
+        Get
+            Return Me.mPreviewH
+        End Get
+    End Property
+
+    Private Sub ToggleChanged()
+        Me.mSurface.Invalidate()
+        Me.NotifyCommandState()
+    End Sub
+
+    ' ------------------------------------------------------------------ viewport
+
+     ' Pair with CloseInput before the host window destroys native widgets.
+    Public Sub OpenInput()
+        Me.mPaletteList.OpenWheel()
+        Me.mInspectorGrid.OpenWheel()
+        Me.mSurface.OpenWheel()
+        If Me.NativeInputError <> "" Then Me.Status(Me.NativeInputError)
+    End Sub
+
+    ''' Takes focus off inspector/native fields so menu and toolbar commands
+    ''' run against the canvas selection, matching a real menu click.
+    Public Sub FocusCanvas()
+        Me.mSurface.Focus()
+    End Sub
+
+    Public Sub CloseInput()
+        Me.mPaletteList.CloseWheel()
+        Me.mInspectorGrid.CloseWheel()
+        Me.mSurface.CloseWheel()
+    End Sub
+
+    Public Property NativeInputError As String
+        Get
+            Return Me.mPaletteList.LastWheelError + Me.mInspectorGrid.LastWheelError + Me.mSurface.LastWheelError
+        End Get
+    End Property
+
+    Public Function StageWheel(dx As Double, dy As Double, pixels As Boolean) As Boolean
+        If Not (dx >= -10000000.0 And dx <= 10000000.0 And dy >= -10000000.0 And dy <= 10000000.0) Then Return False
+        If dx = 0.0 And dy = 0.0 Then Return False
+        If Me.mGesture Or Me.mMarquee Or Me.mPanning Then Return False
+        Dim scale As Double = 1.0
+        If Not pixels Then scale = 48.0
+        Me.SetViewport(Me.mZoom, Math.Max(-10000000.0, Math.Min(10000000.0, Me.mPanX - dx * scale)), Math.Max(-10000000.0, Math.Min(10000000.0, Me.mPanY - dy * scale)))
+        Return True
+    End Function
+
+    Public Sub SetViewport(zoom As Double, panX As Double, panY As Double)
+        If Not (zoom >= 0.05 And zoom <= 32.0) Then Throw New InvalidArgumentException("Zoom must be between 0.05 and 32")
+        If Not (panX >= -10000000.0 And panX <= 10000000.0 And panY >= -10000000.0 And panY <= 10000000.0) Then Throw New InvalidArgumentException("Invalid viewport pan")
+        Me.CancelGesture()
+        Me.mFitPending = False
+        Me.mZoom = zoom
+        Me.mPanX = panX
+        Me.mPanY = panY
+        Me.mSurface.Invalidate()
+        Me.NotifyCommandState()
+    End Sub
+
+    Private Sub ViewportRootChanged()
+        Me.mFocusContainer = ""
+        If Me.FitOnLoad Then
+            Me.mFitPending = True
+            Me.FitViewport()
+        End If
+    End Sub
+
+    ''' Zooms around the centre of the surface (keeps the centre point fixed).
+    Private Sub ZoomTo(zoom As Double)
+        Dim clamped As Double = Math.Max(0.1, Math.Min(16.0, zoom))
+        Dim cx As Double = Me.mSurface.Width / 2.0
+        Dim cy As Double = Me.mSurface.Height / 2.0
+        Dim docX As Double = (cx - Me.mPanX) / Me.mZoom
+        Dim docY As Double = (cy - Me.mPanY) / Me.mZoom
+        Me.SetViewport(clamped, cx - docX * clamped, cy - docY * clamped)
+    End Sub
+
+    Private Function ZoomStep(direction As Integer) As Double
+        Dim steps As Array Of Double = [0.1, 0.25, 0.33, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0]
+        If direction > 0 Then
+            For Each value As Double In steps
+                If value > Me.mZoom + 0.001 Then Return value
+            Next
+            Return 16.0
+        End If
+        For i As Integer = Array.Count(steps) - 1 To 0 Step -1
+            If steps(i) < Me.mZoom - 0.001 Then Return steps(i)
+        Next
+        Return 0.1
+    End Function
+
+    ''' Canvas-space bounds of the active root including its window chrome.
+    Private Function RootWidth() As Integer
+        If Me.mDocument = Nil Then Return 0
+        Dim root As LayoutNode = Me.mDocument.FindNode(Me.mActiveRoot)
+        If root = Nil Then Return 0
+        If root.Width > 0 Then Return root.Width
+        Return 600
+    End Function
+
+    Private Function RootHeight() As Integer
+        If Me.mDocument = Nil Then Return 0
+        Dim root As LayoutNode = Me.mDocument.FindNode(Me.mActiveRoot)
+        If root = Nil Then Return 0
+        If root.Height > 0 Then Return root.Height
+        Return 400
+    End Function
+
+    Private Function ChromeHeight() As Double
+        If Me.mDocument = Nil Then Return 0.0
+        Dim root As LayoutNode = Me.mDocument.FindNode(Me.mActiveRoot)
+        If root = Nil Then Return 0.0
+        If root.TypeName = "Window" Then Return 28.0
+        Return 18.0
+    End Function
+
+    Private Sub FitViewport()
+        Dim sw As Double = Me.mSurface.Width
+        Dim sh As Double = Me.mSurface.Height
+        Dim rw As Double = Me.RootWidth()
+        Dim rh As Double = Me.RootHeight() + Me.ChromeHeight()
+        If rw <= 0.0 Or rh <= 0.0 Or sw < 40.0 Or sh < 40.0 Then Return
+        Me.mFitPending = False
+        Dim margin As Double = 32.0
+        Dim zoom As Double = Math.Min((sw - margin * 2.0) / rw, (sh - margin * 2.0) / rh)
+        zoom = Math.Max(0.1, Math.Min(1.0, zoom))
+        Dim panX As Double = (sw - rw * zoom) / 2.0
+        Dim panY As Double = (sh - rh * zoom) / 2.0 + Me.ChromeHeight() * zoom
+        Me.mZoom = zoom
+        Me.mPanX = panX
+        Me.mPanY = panY
+        Me.mSurface.Invalidate()
+    End Sub
+
+    ' ------------------------------------------------------------ hit testing
+
+    Private Function DocX(screenX As Double) As Double
+        Return (screenX - Me.mPanX) / Me.mZoom
+    End Function
+
+    Private Function DocY(screenY As Double) As Double
+        Return (screenY - Me.mPanY) / Me.mZoom
+    End Function
+
+    Private Function GestureIndex(id As String) As Integer
+        If Not Me.mGesture Then Return -1
+        For i As Integer = 0 To Array.Count(Me.mGestureIds) - 1
+            If Me.mGestureIds(i) = id Then Return i
+        Next
+        Return -1
+    End Function
+
+    Private Function NudgeApplies(id As String) As Boolean
+        If Me.mNudgeDX = 0 And Me.mNudgeDY = 0 Then Return False
+        Return Array.Contains(Me.mNudgeIds, id)
+    End Function
+
+    ' Live (previewed) parent-relative frame of a node.
+    Private Function LocalX(node As LayoutNode) As Integer
+        Dim i As Integer = Me.GestureIndex(node.Id)
+        If i >= 0 Then Return Me.mPrevXs(i)
+        If Me.NudgeApplies(node.Id) Then Return node.X + Me.mNudgeDX
+        Return node.X
+    End Function
+
+    Private Function LocalY(node As LayoutNode) As Integer
+        Dim i As Integer = Me.GestureIndex(node.Id)
+        If i >= 0 Then Return Me.mPrevYs(i)
+        If Me.NudgeApplies(node.Id) Then Return node.Y + Me.mNudgeDY
+        Return node.Y
+    End Function
+
+    Private Function LocalW(node As LayoutNode) As Integer
+        Dim i As Integer = Me.GestureIndex(node.Id)
+        If i >= 0 Then Return Me.mPrevWs(i)
+        Return node.Width
+    End Function
+
+    Private Function LocalH(node As LayoutNode) As Integer
+        Dim i As Integer = Me.GestureIndex(node.Id)
+        If i >= 0 Then Return Me.mPrevHs(i)
+        Return node.Height
+    End Function
+
+    Private Function IsCanvasNode(node As LayoutNode) As Boolean
+        If node.ParentId = "" Or Not Me.InActiveRoot(node) Then Return False
+        Dim parent As LayoutNode = Me.mDocument.FindNode(node.ParentId)
+        While parent <> Nil
+            If parent.ParentId = "" Then Return True
+            ' Only plain literal View containers have known child coordinate semantics.
+            If parent.TypeName <> "View" Or Not parent.HasLiteralFrame Then Return False
+            parent = Me.mDocument.FindNode(parent.ParentId)
+        End While
+        Return False
+    End Function
+
+    ''' Drag/nudge rule: an editable control in a literal coordinate space. Drags
+    ''' and nudges commit per-control FrameEdits, which accept exactly this.
+    Private Function CanMoveNode(node As LayoutNode) As Boolean
+        If node = Nil Then Return False
+        Return node.Editable And Me.IsCanvasNode(node)
+    End Function
+
+    ''' Arrangement rule (align, distribute, spacing, size, centre, multi-control
+    ''' inspector geometry): the LayoutRelations gate, so enablement matches what
+    ''' the model batches accept.
+    Private Function CanArrangeNode(node As LayoutNode) As Boolean
+        If node = Nil Or Me.mDocument = Nil Then Return False
+        Return Me.IsCanvasNode(node) And LayoutRelations.CanArrange(Me.mDocument, node.Id)
+    End Function
+
+    ''' Canvas position of a node (live preview included); roots sit at the origin.
+    Private Function CanvasX(node As LayoutNode) As Integer
+        If node.ParentId = "" Then Return 0
+        Dim x As Integer = Me.LocalX(node)
+        Dim parent As LayoutNode = Me.mDocument.FindNode(node.ParentId)
+        While parent <> Nil
+            If parent.ParentId = "" Then Exit While
+            x += Me.LocalX(parent)
+            parent = Me.mDocument.FindNode(parent.ParentId)
+        End While
+        Return x
+    End Function
+
+    Private Function CanvasY(node As LayoutNode) As Integer
+        If node.ParentId = "" Then Return 0
+        Dim y As Integer = Me.LocalY(node)
+        Dim parent As LayoutNode = Me.mDocument.FindNode(node.ParentId)
+        While parent <> Nil
+            If parent.ParentId = "" Then Exit While
+            y += Me.LocalY(parent)
+            parent = Me.mDocument.FindNode(parent.ParentId)
+        End While
+        Return y
+    End Function
+
+    Private Function NodeCanvasW(node As LayoutNode) As Integer
+        If node.ParentId = "" Then Return Me.RootWidth()
+        Return Me.LocalW(node)
+    End Function
+
+    Private Function NodeCanvasH(node As LayoutNode) As Integer
+        If node.ParentId = "" Then Return Me.RootHeight()
+        Return Me.LocalH(node)
+    End Function
+
+    Private Function HitAncestors(node As LayoutNode, x As Double, y As Double) As Boolean
+        Dim parent As LayoutNode = Me.mDocument.FindNode(node.ParentId)
+        While parent <> Nil
+            Dim px As Integer = Me.CanvasX(parent)
+            Dim py As Integer = Me.CanvasY(parent)
+            If x < px Or y < py Or x > px + Me.NodeCanvasW(parent) Or y > py + Me.NodeCanvasH(parent) Then Return False
+            parent = Me.mDocument.FindNode(parent.ParentId)
+        End While
+        Return True
+    End Function
+
+    Private Sub ClipAncestors(g As IGraphics, node As LayoutNode)
+        Dim parent As LayoutNode = Me.mDocument.FindNode(node.ParentId)
+        While parent <> Nil
+            g.ClipToRect(Me.CanvasX(parent), Me.CanvasY(parent), Me.NodeCanvasW(parent), Me.NodeCanvasH(parent))
+            parent = Me.mDocument.FindNode(parent.ParentId)
+        End While
+    End Sub
+
+    ''' Deepest canvas node under a canvas point (topmost in z-order), or Nil.
+    Private Function NodeAt(x As Double, y As Double) As LayoutNode
+        If Me.mDocument = Nil Then Return Nil
+        Dim nodes As Array Of LayoutNode = Me.mDocument.Nodes
+        For i As Integer = Array.Count(nodes) - 1 To 0 Step -1
+            Dim node As LayoutNode = nodes(i)
+            If Not Me.IsCanvasNode(node) Then Continue For
+            Dim nx As Double = Me.CanvasX(node)
+            Dim ny As Double = Me.CanvasY(node)
+            If x >= nx And y >= ny And x <= nx + node.Width And y <= ny + node.Height And Me.HitAncestors(node, x, y) Then Return node
+        Next
+        Return Nil
+    End Function
+
+    ''' Deepest plain View container (or the active root) containing a canvas point.
+    Private Function ContainerAt(x As Double, y As Double) As String
+        Dim nodes As Array Of LayoutNode = Me.mDocument.Nodes
+        For i As Integer = Array.Count(nodes) - 1 To 0 Step -1
+            Dim node As LayoutNode = nodes(i)
+            If Not Me.IsCanvasNode(node) Then Continue For
+            If node.TypeName <> "View" Or Not node.HasLiteralFrame Then Continue For
+            Dim nx As Double = Me.CanvasX(node)
+            Dim ny As Double = Me.CanvasY(node)
+            If x >= nx And y >= ny And x <= nx + node.Width And y <= ny + node.Height And Me.HitAncestors(node, x, y) Then Return node.Id
+        Next
+        Return Me.mActiveRoot
+    End Function
+
+    ' Handle order: 0 NW, 1 N, 2 NE, 3 E, 4 SE, 5 S, 6 SW, 7 W.
+    Private Function HandlePointX(index As Integer, x As Double, w As Double) As Double
+        Select Case index
+            Case 0, 6, 7
+                Return x
+            Case 1, 5
+                Return x + w / 2.0
+        End Select
+        Return x + w
+    End Function
+
+    Private Function HandlePointY(index As Integer, y As Double, h As Double) As Double
+        Select Case index
+            Case 0, 1, 2
+                Return y
+            Case 3, 7
+                Return y + h / 2.0
+        End Select
+        Return y + h
+    End Function
+
+    ''' Returns handle index under a screen point for a selected movable node, and
+    ''' stores that node in mRefId; -1 when no handle is hit.
+    Private Function HandleAt(screenX As Double, screenY As Double) As Integer
+        If Me.mDocument = Nil Then Return -1
+        Dim x As Double = Me.DocX(screenX)
+        Dim y As Double = Me.DocY(screenY)
+        For Each id As String In Me.mSelection
+            Dim node As LayoutNode = Me.mDocument.FindNode(id)
+            If Not Me.CanMoveNode(node) Then Continue For
+            Dim sx As Double = Me.CanvasX(node) * Me.mZoom + Me.mPanX
+            Dim sy As Double = Me.CanvasY(node) * Me.mZoom + Me.mPanY
+            Dim sw As Double = node.Width * Me.mZoom
+            Dim sh As Double = node.Height * Me.mZoom
+            ' Corners first, then edge midpoints (only when the control is large enough).
+            For Each index As Integer In [4, 0, 2, 6, 1, 3, 5, 7]
+                If index = 1 Or index = 5 Then
+                    If sw < 24.0 Then Continue For
+                End If
+                If index = 3 Or index = 7 Then
+                    If sh < 24.0 Then Continue For
+                End If
+                Dim hx As Double = Me.HandlePointX(index, sx, sw)
+                Dim hy As Double = Me.HandlePointY(index, sy, sh)
+                If Math.Abs(screenX - hx) <= 5.0 And Math.Abs(screenY - hy) <= 5.0 Then
+                    If Me.HitAncestors(node, Me.DocX(hx), Me.DocY(hy)) Or Me.HitAncestors(node, x, y) Then
+                        Me.mRefId = node.Id
+                        Return index
+                    End If
+                End If
+            Next
+        Next
+        Return -1
+    End Function
+
+    Private Function HandleCursor(index As Integer) As CursorType
+        Select Case index
+            Case 0, 4
+                Return CursorType.ResizeNWSE
+            Case 2, 6
+                Return CursorType.ResizeNESW
+            Case 1, 5
+                Return CursorType.ResizeNS
+            Case 3, 7
+                Return CursorType.ResizeEW
+        End Select
+        Return CursorType.Default
+    End Function
+
+    ''' The cursor the surface shows over a screen point (also useful for tests).
+    Public Function CursorAt(screenX As Double, screenY As Double) As CursorType
+        If Me.mPanning Then Return CursorType.HandClosed
+        If Me.mSpaceDown Then Return CursorType.HandOpen
+        If Me.mPlacementArmed Then Return CursorType.Crosshair
+        If Me.mDocument = Nil Then Return CursorType.Default
+        Dim keepRef As String = Me.mRefId
+        Dim index As Integer = Me.HandleAt(screenX, screenY)
+        Me.mRefId = keepRef
+        If index >= 0 Then Return Me.HandleCursor(index)
+        Dim hit As LayoutNode = Me.NodeAt(Me.DocX(screenX), Me.DocY(screenY))
+        If hit <> Nil Then
+            If Me.IsSelected(hit.Id) And Me.CanMoveNode(hit) Then Return CursorType.Move
+        End If
+        Return CursorType.Default
+    End Function
+
+    ' ------------------------------------------------------------ pointer input
+
+    ''' Coordinates are canvas pixels. The document geometry is never changed by a
+    ''' gesture until it ends. Returns True when a move/resize gesture started.
+    ''' An explicit resize uses the bottom-right handle of the hit control.
+    Public Function BeginGesture(screenX As Double, screenY As Double, resize As Boolean = False) As Boolean
+        Return Me.StartPointer(screenX, screenY, resize, 1, False, False, False, False)
+    End Function
+
+    ''' Full pointer entry point used by the surface: Shift or Primary toggles a
+    ''' control in the selection, Option duplicates on drag, a second click edits
+    ''' or enters a container, and middle-button (or Space) drags pan.
+    Public Function PointerDown(screenX As Double, screenY As Double, clickCount As Integer, shift As Boolean, option As Boolean, primary As Boolean, middle As Boolean = False) As Boolean
+        Return Me.StartPointer(screenX, screenY, False, clickCount, shift, option, primary, middle)
+    End Function
+
+    Public Sub UpdateGesture(screenX As Double, screenY As Double)
+        Me.mShiftDown = False
+        Me.mPrimaryDown = False
+        Me.TrackPointer(screenX, screenY)
+    End Sub
+
+    ''' Shift constrains (axis lock on move, aspect ratio on corner resize);
+    ''' Primary suppresses smart-guide and grid snapping.
+    Public Sub PointerDrag(screenX As Double, screenY As Double, shift As Boolean, option As Boolean, primary As Boolean)
+        Me.mShiftDown = shift
+        Me.mPrimaryDown = primary
+        Me.TrackPointer(screenX, screenY)
+    End Sub
+
+    Public Function EndGesture() As Boolean
+        Return Me.FinishPointer()
+    End Function
+
+    Public Function PointerUp() As Boolean
+        Return Me.FinishPointer()
+    End Function
+
+    Public Sub PointerMove(screenX As Double, screenY As Double)
+        Me.mPointerX = screenX
+        Me.mPointerY = screenY
+        If Me.mPlacementArmed Then Me.mSurface.Invalidate()
+        If Me.mGesture Or Me.mMarquee Or Me.mPanning Then Return
+        Dim wanted As CursorType = Me.CursorAt(screenX, screenY)
+        If Me.mSurface.Cursor <> wanted Then Me.mSurface.Cursor = wanted
+    End Sub
+
+    Public Sub PointerExited()
+        Me.CancelGesture()
+        Me.mSpaceDown = False
+        Me.mSurface.Cursor = CursorType.Default
+    End Sub
+
+    Private Function StartPointer(screenX As Double, screenY As Double, resize As Boolean, clickCount As Integer, shift As Boolean, option As Boolean, primary As Boolean, middle As Boolean) As Boolean
+        Me.FlushNudge()
+        Me.CancelGesture()
+        Me.mShiftDown = shift
+        Me.mOptionDown = option
+        Me.mPrimaryDown = primary
+        Me.mPointerX = screenX
+        Me.mPointerY = screenY
+        Me.mStartScreenX = screenX
+        Me.mStartScreenY = screenY
+        If middle Or Me.mSpaceDown Then
+            Me.mPanning = True
+            Me.mPanOriginX = Me.mPanX
+            Me.mPanOriginY = Me.mPanY
+            Me.mSurface.Cursor = CursorType.HandClosed
+            Return False
+        End If
+        If Me.mPlacementArmed Then
+            Me.PlaceControl(screenX, screenY)
+            Return False
+        End If
+        If Me.mDocument = Nil Then Return False
+        Dim x As Double = Me.DocX(screenX)
+        Dim y As Double = Me.DocY(screenY)
+        Dim toggle As Boolean = shift Or primary
+        Dim hit As LayoutNode
+        Dim handle As Integer = -1
+        If Not toggle Then
+            If resize Then
+                hit = Me.NodeAt(x, y)
+                If hit <> Nil Then handle = 4
+            Else
+                handle = Me.HandleAt(screenX, screenY)
+                If handle >= 0 Then hit = Me.mDocument.FindNode(Me.mRefId)
+            End If
+        End If
+        If hit = Nil Then hit = Me.NodeAt(x, y)
+        ' Inside an entered container its background starts a marquee.
+        If hit <> Nil And Me.mFocusContainer <> "" And hit.Id = Me.mFocusContainer And handle < 0 Then hit = Nil
+        If Me.mFocusContainer <> "" And hit <> Nil Then
+            If Not Me.IsDescendantOf(hit, Me.mFocusContainer) Then Me.mFocusContainer = ""
+        End If
+        Dim previousHit As String = Me.mLastPointerHit
+        Me.mLastPointerHit = ""
+        If hit <> Nil Then Me.mLastPointerHit = hit.Id
+        ' A handle always starts resizing, including a quick second click after
+        ' selection. Double-click editing applies only to the same control body.
+        If clickCount >= 2 And handle < 0 And (hit = Nil Or Me.mLastPointerHit = previousHit) Then
+            Me.DoubleClicked(hit, x, y)
+            Return False
+        End If
+        If hit = Nil Then
+            Me.StartMarquee(x, y, toggle)
+            Return False
+        End If
+        Dim snapshot As LayoutDocument = Me.mDocument
+        Dim zoomBefore As Double = Me.mZoom
+        Dim panXBefore As Double = Me.mPanX
+        Dim panYBefore As Double = Me.mPanY
+        Me.mMakeKeyOnRelease = ""
+        If toggle Then
+            Dim updated As Array Of String = Me.SelectedIds()
+            If Me.IsSelected(hit.Id) Then
+                Dim without As Array Of String = []
+                For Each id As String In updated
+                    If id <> hit.Id Then without.Append(id)
+                Next
+                Me.SelectNodes(without)
+                Return False
+            End If
+            updated.Append(hit.Id)
+            Me.SelectNodes(updated)
+        ElseIf Me.IsSelected(hit.Id) And Array.Count(Me.mSelection) > 1 Then
+            If hit.Id <> Me.mSelected Then Me.mMakeKeyOnRelease = hit.Id
+        Else
+            Me.SelectNode(hit.Id)
+        End If
+        If snapshot <> Me.mDocument Or zoomBefore <> Me.mZoom Or panXBefore <> Me.mPanX Or panYBefore <> Me.mPanY Then Return False
+        ' Selection callbacks may synchronously reload or detach the editor.
+        If Me.mHost = Nil Or Me.mDocument = Nil Then Return False
+        Dim reference As LayoutNode = Me.mDocument.FindNode(hit.Id)
+        If reference = Nil Or Not Me.IsSelected(hit.Id) Then Return False
+        If Not Me.CanMoveNode(reference) Then Return False
+        Dim ids As Array Of String = []
+        If handle >= 0 Then
+            ' Group resize applies the reference control's deltas to every selected control.
+            ids.Append(reference.Id)
+        End If
+        For Each id As String In Me.mSelection
+            If Array.Contains(ids, id) Then Continue For
+            If Me.CanMoveNode(Me.mDocument.FindNode(id)) Then
+                If id = reference.Id Then
+                    Array.Insert(ids, 0, id)
+                Else
+                    ids.Append(id)
+                End If
+            End If
+        Next
+        Me.mGestureIds = ids
+        Me.mOrigXs = []
+        Me.mOrigYs = []
+        Me.mOrigWs = []
+        Me.mOrigHs = []
+        For Each id As String In ids
+            Dim node As LayoutNode = Me.mDocument.FindNode(id)
+            Me.mOrigXs.Append(node.X)
+            Me.mOrigYs.Append(node.Y)
+            Me.mOrigWs.Append(node.Width)
+            Me.mOrigHs.Append(node.Height)
+        Next
+        Me.mPrevXs = Me.CopyInts(Me.mOrigXs)
+        Me.mPrevYs = Me.CopyInts(Me.mOrigYs)
+        Me.mPrevWs = Me.CopyInts(Me.mOrigWs)
+        Me.mPrevHs = Me.CopyInts(Me.mOrigHs)
+        Me.mRefId = reference.Id
+        Me.mResize = handle >= 0
+        Me.mHandle = handle
+        Me.mMoved = False
+        ' Option-drag duplicates (only when the controls share a container).
+        Me.mDuplicateDrag = option And handle < 0 And Me.SharedParent(ids) <> ""
+        Me.mStartX = x
+        Me.mStartY = y
+        Me.mOriginalX = reference.X
+        Me.mOriginalY = reference.Y
+        Me.mOriginalW = reference.Width
+        Me.mOriginalH = reference.Height
+        Me.mPreviewX = reference.X
+        Me.mPreviewY = reference.Y
+        Me.mPreviewW = reference.Width
+        Me.mPreviewH = reference.Height
+        Me.mGestureVersion = Me.mDocument.Version
+        Me.mGesture = True
+        Me.CollectGuideTargets(reference)
+        Return True
+    End Function
+
+    Private Function CopyInts(values As Array Of Integer) As Array Of Integer
+        Dim copied As Array Of Integer = []
+        For Each value As Integer In values
+            copied.Append(value)
+        Next
+        Return copied
+    End Function
+
+    Private Function IsDescendantOf(node As LayoutNode, ancestorId As String) As Boolean
+        Dim parent As LayoutNode = Me.mDocument.FindNode(node.ParentId)
+        While parent <> Nil
+            If parent.Id = ancestorId Then Return True
+            parent = Me.mDocument.FindNode(parent.ParentId)
+        End While
+        Return False
+    End Function
+
+    Private Sub DoubleClicked(hit As LayoutNode, x As Double, y As Double)
+        If hit = Nil Then
+            Me.mFocusContainer = ""
+            Me.SelectNodes(Me.NoIds())
+            Return
+        End If
+        If hit.TypeName = "View" And hit.HasLiteralFrame Then
+            ' Enter the container: its children become directly selectable and
+            ' empty clicks inside it start a marquee among them.
+            Me.mFocusContainer = hit.Id
+            For Each child As LayoutNode In Me.mDocument.Nodes
+                If child.ParentId = hit.Id And Me.IsCanvasNode(child) Then
+                    Me.SelectNode(child.Id)
+                    Me.Status("Editing inside " + hit.Name + ". Press Escape or click outside to leave.")
+                    Return
+                End If
+            Next
+            Me.SelectNode(hit.Id)
+            Me.Status("Editing inside " + hit.Name + ". Drag on it to select its children.")
+            Return
+        End If
+        If Not Me.IsSelected(hit.Id) Or Array.Count(Me.mSelection) <> 1 Then Me.SelectNode(hit.Id)
+        Me.FocusPrimaryProperty()
+    End Sub
+
+    Private Sub StartMarquee(x As Double, y As Double, additive As Boolean)
+        Me.mMarqueeAdditive = additive
+        Me.mMarqueeBase = []
+        If additive Then Me.mMarqueeBase = Me.SelectedIds()
+        Me.mMarqueeContainer = Me.mActiveRoot
+        If Me.mFocusContainer <> "" Then
+            Dim focus As LayoutNode = Me.mDocument.FindNode(Me.mFocusContainer)
+            If focus <> Nil Then
+                Dim fx As Double = Me.CanvasX(focus)
+                Dim fy As Double = Me.CanvasY(focus)
+                If x >= fx And y >= fy And x <= fx + focus.Width And y <= fy + focus.Height Then
+                    Me.mMarqueeContainer = focus.Id
+                Else
+                    Me.mFocusContainer = ""
+                End If
+            End If
+        End If
+        If Not additive Then
+            Dim changed As Boolean = Array.Count(Me.mSelection) > 0
+            Me.ApplySelection(Me.NoIds())
+            If changed Then
+                Me.ExpireBindings()
+                Me.RefreshInspector()
+                If Me.mHost <> Nil Then Me.mHost.LayoutSelectionChanged("")
+                Me.NotifyCommandState()
+            End If
+        End If
+        Me.mMarquee = True
+        Me.mMarqueeX0 = x
+        Me.mMarqueeY0 = y
+        Me.mMarqueeX1 = x
+        Me.mMarqueeY1 = y
+        Me.mSurface.Invalidate()
+    End Sub
+
+    Private Sub UpdateMarqueeSelection()
+        Dim left As Double = Math.Min(Me.mMarqueeX0, Me.mMarqueeX1)
+        Dim top As Double = Math.Min(Me.mMarqueeY0, Me.mMarqueeY1)
+        Dim right As Double = Math.Max(Me.mMarqueeX0, Me.mMarqueeX1)
+        Dim bottom As Double = Math.Max(Me.mMarqueeY0, Me.mMarqueeY1)
+        Dim ids As Array Of String = []
+        For Each id As String In Me.mMarqueeBase
+            ids.Append(id)
+        Next
+        For Each node As LayoutNode In Me.mDocument.Nodes
+            If node.ParentId <> Me.mMarqueeContainer Or Not Me.IsCanvasNode(node) Then Continue For
+            Dim nx As Double = Me.CanvasX(node)
+            Dim ny As Double = Me.CanvasY(node)
+            If nx > right Or ny > bottom Or nx + node.Width < left Or ny + node.Height < top Then Continue For
+            If Not Array.Contains(ids, node.Id) Then ids.Append(node.Id)
+        Next
+        Me.ApplySelection(ids)
+    End Sub
+
+    Private Sub TrackPointer(screenX As Double, screenY As Double)
+        Me.mPointerX = screenX
+        Me.mPointerY = screenY
+        If Me.mPanning Then
+            Me.mPanX = Me.mPanOriginX + (screenX - Me.mStartScreenX)
+            Me.mPanY = Me.mPanOriginY + (screenY - Me.mStartScreenY)
+            Me.mSurface.Invalidate()
+            Return
+        End If
+        If Me.mMarquee Then
+            Me.mMarqueeX1 = Me.DocX(screenX)
+            Me.mMarqueeY1 = Me.DocY(screenY)
+            Me.UpdateMarqueeSelection()
+            Me.mSurface.Invalidate()
+            Return
+        End If
+        If Not Me.mGesture Then Return
+        If Not Me.mMoved Then
+            If Math.Abs(screenX - Me.mStartScreenX) >= 3.0 Or Math.Abs(screenY - Me.mStartScreenY) >= 3.0 Then Me.mMoved = True
+        End If
+        Dim rawX As Double = 0.0
+        Dim rawY As Double = 0.0
+        If Me.mMoved Then
+            rawX = Me.DocX(screenX) - Me.mStartX
+            rawY = Me.DocY(screenY) - Me.mStartY
+        End If
+        Dim dx As Integer = Math.Round(rawX)
+        Dim dy As Integer = Math.Round(rawY)
+        Dim px As Integer = Me.mOriginalX
+        Dim py As Integer = Me.mOriginalY
+        Dim pw As Integer = Me.mOriginalW
+        Dim ph As Integer = Me.mOriginalH
+        Dim snapping As Boolean = Not Me.mPrimaryDown
+        Dim useGuides As Boolean = snapping And Me.mSmartGuides And Me.mMoved And Me.RelationTolerance <= 0
+        Me.mGuides = []
+        Me.mSpacing = []
+        Dim reference As LayoutNode = Me.mDocument.FindNode(Me.mRefId)
+        Dim originX As Double = 0.0
+        Dim originY As Double = 0.0
+        If reference <> Nil Then
+            originX = Me.CanvasX(reference) - Me.LocalX(reference)
+            originY = Me.CanvasY(reference) - Me.LocalY(reference)
+        End If
+        If Me.mResize Then
+            Dim leftEdge As Boolean = Me.mHandle = 0 Or Me.mHandle = 6 Or Me.mHandle = 7
+            Dim rightEdge As Boolean = Me.mHandle = 2 Or Me.mHandle = 3 Or Me.mHandle = 4
+            Dim topEdge As Boolean = Me.mHandle = 0 Or Me.mHandle = 1 Or Me.mHandle = 2
+            Dim bottomEdge As Boolean = Me.mHandle = 4 Or Me.mHandle = 5 Or Me.mHandle = 6
+            Dim l As Integer = Me.mOriginalX
+            Dim r As Integer = Me.mOriginalX + Me.mOriginalW
+            Dim t As Integer = Me.mOriginalY
+            Dim b As Integer = Me.mOriginalY + Me.mOriginalH
+            If leftEdge Then l = Me.SnapEdge(l + dx, originX, True, snapping, useGuides)
+            If rightEdge Then r = Me.SnapEdge(r + dx, originX, True, snapping, useGuides)
+            If topEdge Then t = Me.SnapEdge(t + dy, originY, False, snapping, useGuides)
+            If bottomEdge Then b = Me.SnapEdge(b + dy, originY, False, snapping, useGuides)
+            If leftEdge Then l = Math.Min(l, r - 1)
+            If rightEdge Then r = Math.Max(r, l + 1)
+            If topEdge Then t = Math.Min(t, b - 1)
+            If bottomEdge Then b = Math.Max(b, t + 1)
+            px = l
+            py = t
+            pw = r - l
+            ph = b - t
+            Dim corner As Boolean = Me.mHandle = 0 Or Me.mHandle = 2 Or Me.mHandle = 4 Or Me.mHandle = 6
+            If Me.mShiftDown And corner And Me.mOriginalW > 0 And Me.mOriginalH > 0 Then
+                Dim baseW As Double = Me.mOriginalW
+                Dim baseH As Double = Me.mOriginalH
+                Dim ratioW As Double = pw / baseW
+                Dim ratioH As Double = ph / baseH
+                Dim scale As Double = Math.Max(ratioW, ratioH)
+                pw = Math.Max(1, Math.Round(Me.mOriginalW * scale))
+                ph = Math.Max(1, Math.Round(Me.mOriginalH * scale))
+                If leftEdge Then px = Me.mOriginalX + Me.mOriginalW - pw
+                If topEdge Then py = Me.mOriginalY + Me.mOriginalH - ph
+            End If
+        Else
+            If Me.mShiftDown Then
+                If Math.Abs(rawX) >= Math.Abs(rawY) Then
+                    dy = 0
+                Else
+                    dx = 0
+                End If
+            End If
+            If snapping And Me.mSnapToGrid Then
+                If Not (Me.mShiftDown And dx = 0) Then dx = Me.Snap(Me.mOriginalX + dx) - Me.mOriginalX
+                If Not (Me.mShiftDown And dy = 0) Then dy = Me.Snap(Me.mOriginalY + dy) - Me.mOriginalY
+            End If
+            If useGuides Then
+                Dim lockX As Boolean = Me.mShiftDown And dx = 0
+                Dim lockY As Boolean = Me.mShiftDown And dy = 0
+                If Not lockX Then dx += Me.GuideCorrection(Me.GroupEdges(dx, dy, True), Me.mTargetsX)
+                If Not lockY Then dy += Me.GuideCorrection(Me.GroupEdges(dx, dy, False), Me.mTargetsY)
+            End If
+            px = Me.mOriginalX + dx
+            py = Me.mOriginalY + dy
+        End If
+        Me.RelationGuides = JSONItem.NewArray()
+        If Me.RelationTolerance > 0 And Array.Count(Me.mGestureIds) = 1 And (Not Me.mResize Or Me.mHandle = 4) Then
+            Dim snapped As JSONItem = LayoutRelations.Snap(Me.mDocument, Me.mRefId, px, py, pw, ph, Me.RelationTolerance, Me.RelationMargins, Me.RelationSpacing, Me.mResize)
+            px = snapped.Value("x").AsNumber().Or(px)
+            py = snapped.Value("y").AsNumber().Or(py)
+            pw = snapped.Value("width").AsNumber().Or(pw)
+            ph = snapped.Value("height").AsNumber().Or(ph)
+            Me.RelationGuides = snapped.Value("guides")
+        End If
+        Me.mPreviewX = px
+        Me.mPreviewY = py
+        Me.mPreviewW = pw
+        Me.mPreviewH = ph
+        Dim ddx As Integer = px - Me.mOriginalX
+        Dim ddy As Integer = py - Me.mOriginalY
+        Dim ddw As Integer = pw - Me.mOriginalW
+        Dim ddh As Integer = ph - Me.mOriginalH
+        Dim anchorRight As Boolean = Me.mResize And (Me.mHandle = 0 Or Me.mHandle = 6 Or Me.mHandle = 7)
+        Dim anchorBottom As Boolean = Me.mResize And (Me.mHandle = 0 Or Me.mHandle = 1 Or Me.mHandle = 2)
+        For i As Integer = 0 To Array.Count(Me.mGestureIds) - 1
+            Me.mPrevWs(i) = Math.Max(1, Me.mOrigWs(i) + ddw)
+            Me.mPrevHs(i) = Math.Max(1, Me.mOrigHs(i) + ddh)
+            Me.mPrevXs(i) = Me.mOrigXs(i) + ddx
+            Me.mPrevYs(i) = Me.mOrigYs(i) + ddy
+            ' Left/top handles keep each control's opposite edge fixed when clamped.
+            If anchorRight Then Me.mPrevXs(i) = Me.mOrigXs(i) + Me.mOrigWs(i) - Me.mPrevWs(i)
+            If anchorBottom Then Me.mPrevYs(i) = Me.mOrigYs(i) + Me.mOrigHs(i) - Me.mPrevHs(i)
+        Next
+        If Me.mMoved And (Me.mSmartGuides Or Me.mShowSpacing) Then Me.ComputeGuideOverlay()
+        Me.mSurface.Invalidate()
+    End Sub
+
+    Private Function Snap(value As Integer) As Integer
+        Dim size As Integer = Me.EffectiveGrid()
+        If size <= 1 Then Return value
+        Dim stepSize As Double = size
+        Dim rounded As Integer = Math.Round(value / stepSize)
+        Return rounded * size
+    End Function
+
+    Private Function EffectiveGrid() As Integer
+        If Me.mGridSize > 1 Then Return Me.mGridSize
+        Return 10
+    End Function
+
+    ''' Snaps a moving edge (parent-relative) to the grid and/or smart-guide targets.
+    Private Function SnapEdge(value As Integer, origin As Double, horizontal As Boolean, snapping As Boolean, useGuides As Boolean) As Integer
+        Dim snappedValue As Integer = value
+        If snapping And Me.mSnapToGrid Then snappedValue = Me.Snap(value)
+        If useGuides Then
+            Dim targets As Array Of Double = Me.mTargetsY
+            If horizontal Then targets = Me.mTargetsX
+            Dim correction As Double = Me.GuideCorrection([origin + snappedValue], targets)
+            snappedValue += Math.Round(correction)
+        End If
+        Return snappedValue
+    End Function
+
+    ''' Canvas positions of the moving group's leading edge, centre and trailing
+    ''' edge along one axis for a candidate delta.
+    Private Function GroupEdges(dx As Integer, dy As Integer, horizontal As Boolean) As Array Of Double
+        Dim low As Double = 1.0E12
+        Dim high As Double = -1.0E12
+        For i As Integer = 0 To Array.Count(Me.mGestureIds) - 1
+            Dim node As LayoutNode = Me.mDocument.FindNode(Me.mGestureIds(i))
+            If node = Nil Then Continue For
+            Dim parentOrigin As Double
+            Dim startValue As Double
+            Dim extent As Double
+            If horizontal Then
+                parentOrigin = Me.CanvasX(node) - Me.LocalX(node)
+                startValue = parentOrigin + Me.mOrigXs(i) + dx
+                extent = Me.mOrigWs(i)
+            Else
+                parentOrigin = Me.CanvasY(node) - Me.LocalY(node)
+                startValue = parentOrigin + Me.mOrigYs(i) + dy
+                extent = Me.mOrigHs(i)
+            End If
+            low = Math.Min(low, startValue)
+            high = Math.Max(high, startValue + extent)
+        Next
+        Return [low, (low + high) / 2.0, high]
+    End Function
+
+    ''' Smallest correction bringing any edge onto a target within tolerance; 0 if none.
+    Private Function GuideCorrection(edges As Array Of Double, targets As Array Of Double) As Double
+        Dim tolerance As Double = Me.GuideTolerance / Me.mZoom
+        Dim best As Double = 0.0
+        Dim bestDistance As Double = tolerance + 1.0
+        For Each edge As Double In edges
+            For Each target As Double In targets
+                Dim distance As Double = Math.Abs(target - edge)
+                If distance <= tolerance And distance < bestDistance Then
+                    bestDistance = distance
+                    best = target - edge
+                End If
+            Next
+        Next
+        Return best
+    End Function
+
+    Private Sub AddTarget(horizontal As Boolean, position As Double, extentFrom As Double, extentTo As Double)
+        If horizontal Then
+            Me.mTargetsX.Append(position)
+            Me.mTargetsXFrom.Append(extentFrom)
+            Me.mTargetsXTo.Append(extentTo)
+        Else
+            Me.mTargetsY.Append(position)
+            Me.mTargetsYFrom.Append(extentFrom)
+            Me.mTargetsYTo.Append(extentTo)
+        End If
+    End Sub
+
+    ''' Sibling edges/centres and parent edges/centre/margins of the reference
+    ''' control's container, excluding every control that moves with the gesture.
+    Private Sub CollectGuideTargets(reference As LayoutNode)
+        Me.mTargetsX = []
+        Me.mTargetsXFrom = []
+        Me.mTargetsXTo = []
+        Me.mTargetsY = []
+        Me.mTargetsYFrom = []
+        Me.mTargetsYTo = []
+        Me.mPeerRects = []
+        Me.mParentRect = []
+        Dim parent As LayoutNode = Me.mDocument.FindNode(reference.ParentId)
+        If parent = Nil Then Return
+        Dim px As Double = Me.CanvasX(parent)
+        Dim py As Double = Me.CanvasY(parent)
+        Dim pw As Double = Me.NodeCanvasW(parent)
+        Dim ph As Double = Me.NodeCanvasH(parent)
+        Me.mParentRect = [px, py, pw, ph]
+        Me.AddTarget(True, px, py, py + ph)
+        Me.AddTarget(True, px + pw / 2.0, py, py + ph)
+        Me.AddTarget(True, px + pw, py, py + ph)
+        Me.AddTarget(False, py, px, px + pw)
+        Me.AddTarget(False, py + ph / 2.0, px, px + pw)
+        Me.AddTarget(False, py + ph, px, px + pw)
+        If Me.GuideMargin > 0 And pw > Me.GuideMargin * 2 And ph > Me.GuideMargin * 2 Then
+            Me.AddTarget(True, px + Me.GuideMargin, py, py + ph)
+            Me.AddTarget(True, px + pw - Me.GuideMargin, py, py + ph)
+            Me.AddTarget(False, py + Me.GuideMargin, px, px + pw)
+            Me.AddTarget(False, py + ph - Me.GuideMargin, px, px + pw)
+        End If
+        For Each peer As LayoutNode In Me.mDocument.Nodes
+            If peer.ParentId <> parent.Id Or Not Me.IsCanvasNode(peer) Then Continue For
+            If Array.Contains(Me.mGestureIds, peer.Id) Then Continue For
+            Dim sx As Double = Me.CanvasX(peer)
+            Dim sy As Double = Me.CanvasY(peer)
+            Dim sw As Double = peer.Width
+            Dim sh As Double = peer.Height
+            Me.mPeerRects.Append(sx)
+            Me.mPeerRects.Append(sy)
+            Me.mPeerRects.Append(sw)
+            Me.mPeerRects.Append(sh)
+            Me.AddTarget(True, sx, sy, sy + sh)
+            Me.AddTarget(True, sx + sw / 2.0, sy, sy + sh)
+            Me.AddTarget(True, sx + sw, sy, sy + sh)
+            Me.AddTarget(False, sy, sx, sx + sw)
+            Me.AddTarget(False, sy + sh / 2.0, sx, sx + sw)
+            Me.AddTarget(False, sy + sh, sx, sx + sw)
+        Next
+    End Sub
+
+    ''' Live bounding box (canvas coordinates) of the gesture or nudge controls.
+    Private Function MovingBounds(ids As Array Of String) As Array Of Double
+        Dim left As Double = 1.0E12
+        Dim top As Double = 1.0E12
+        Dim right As Double = -1.0E12
+        Dim bottom As Double = -1.0E12
+        For Each id As String In ids
+            Dim node As LayoutNode = Me.mDocument.FindNode(id)
+            If node = Nil Then Continue For
+            Dim x As Double = Me.CanvasX(node)
+            Dim y As Double = Me.CanvasY(node)
+            left = Math.Min(left, x)
+            top = Math.Min(top, y)
+            right = Math.Max(right, x + Me.LocalW(node))
+            bottom = Math.Max(bottom, y + Me.LocalH(node))
+        Next
+        Return [left, top, right, bottom]
+    End Function
+
+    Private Sub ComputeGuideOverlay()
+        Me.mGuides = []
+        Me.mSpacing = []
+        If Me.mDocument = Nil Then Return
+        Dim bounds As Array Of Double = Me.MovingBounds(Me.mGestureIds)
+        If bounds(0) > bounds(2) Then Return
+        If Me.mSmartGuides And Not Me.mPrimaryDown Then
+            Dim xs As Array Of Double = [bounds(0), (bounds(0) + bounds(2)) / 2.0, bounds(2)]
+            Dim ys As Array Of Double = [bounds(1), (bounds(1) + bounds(3)) / 2.0, bounds(3)]
+            Dim shownX As Array Of Double = []
+            For i As Integer = 0 To Array.Count(Me.mTargetsX) - 1
+                Dim target As Double = Me.mTargetsX(i)
+                For Each edge As Double In xs
+                    If Math.Abs(edge - target) < 0.5 And Not Array.Contains(shownX, target) Then
+                        shownX.Append(target)
+                        Me.AddGuide(0.0, target, Math.Min(bounds(1), Me.mTargetsXFrom(i)), Math.Max(bounds(3), Me.mTargetsXTo(i)))
+                    End If
+                Next
+            Next
+            Dim shownY As Array Of Double = []
+            For i As Integer = 0 To Array.Count(Me.mTargetsY) - 1
+                Dim target As Double = Me.mTargetsY(i)
+                For Each edge As Double In ys
+                    If Math.Abs(edge - target) < 0.5 And Not Array.Contains(shownY, target) Then
+                        shownY.Append(target)
+                        Me.AddGuide(1.0, target, Math.Min(bounds(0), Me.mTargetsYFrom(i)), Math.Max(bounds(2), Me.mTargetsYTo(i)))
+                    End If
+                Next
+            Next
+        End If
+        If Me.mShowSpacing Then Me.ComputeSpacing(bounds)
+    End Sub
+
+    Private Sub AddGuide(orientation As Double, position As Double, extentFrom As Double, extentTo As Double)
+        Me.mGuides.Append(orientation)
+        Me.mGuides.Append(position)
+        Me.mGuides.Append(extentFrom)
+        Me.mGuides.Append(extentTo)
+    End Sub
+
+    ''' Distances from the moving bounds to the nearest neighbour (or the parent
+    ''' edge) in each direction.
+    Private Sub ComputeSpacing(bounds As Array Of Double)
+        If Array.Count(Me.mParentRect) < 4 Then Return
+        Dim left As Double = bounds(0)
+        Dim top As Double = bounds(1)
+        Dim right As Double = bounds(2)
+        Dim bottom As Double = bounds(3)
+        Dim midX As Double = (left + right) / 2.0
+        Dim midY As Double = (top + bottom) / 2.0
+        Dim leftLimit As Double = Me.mParentRect(0)
+        Dim topLimit As Double = Me.mParentRect(1)
+        Dim rightLimit As Double = Me.mParentRect(0) + Me.mParentRect(2)
+        Dim bottomLimit As Double = Me.mParentRect(1) + Me.mParentRect(3)
+        Dim leftY As Double = midY
+        Dim rightY As Double = midY
+        Dim topX As Double = midX
+        Dim bottomX As Double = midX
+        Dim count As Integer = Array.Count(Me.mPeerRects) \ 4
+        For i As Integer = 0 To count - 1
+            Dim sx As Double = Me.mPeerRects(i * 4)
+            Dim sy As Double = Me.mPeerRects(i * 4 + 1)
+            Dim sr As Double = sx + Me.mPeerRects(i * 4 + 2)
+            Dim sb As Double = sy + Me.mPeerRects(i * 4 + 3)
+            Dim overlapY As Boolean = sy < bottom And sb > top
+            Dim overlapX As Boolean = sx < right And sr > left
+            If overlapY And sr <= left And sr > leftLimit Then
+                leftLimit = sr
+                leftY = (Math.Max(top, sy) + Math.Min(bottom, sb)) / 2.0
+            End If
+            If overlapY And sx >= right And sx < rightLimit Then
+                rightLimit = sx
+                rightY = (Math.Max(top, sy) + Math.Min(bottom, sb)) / 2.0
+            End If
+            If overlapX And sb <= top And sb > topLimit Then
+                topLimit = sb
+                topX = (Math.Max(left, sx) + Math.Min(right, sr)) / 2.0
+            End If
+            If overlapX And sy >= bottom And sy < bottomLimit Then
+                bottomLimit = sy
+                bottomX = (Math.Max(left, sx) + Math.Min(right, sr)) / 2.0
+            End If
+        Next
+        Me.AddSpacing(leftLimit, leftY, left, leftY)
+        Me.AddSpacing(right, rightY, rightLimit, rightY)
+        Me.AddSpacing(topX, topLimit, topX, top)
+        Me.AddSpacing(bottomX, bottom, bottomX, bottomLimit)
+    End Sub
+
+    Private Sub AddSpacing(x1 As Double, y1 As Double, x2 As Double, y2 As Double)
+        Dim distance As Double = Math.Max(Math.Abs(x2 - x1), Math.Abs(y2 - y1))
+        If distance < 1.0 Then Return
+        Me.mSpacing.Append(x1)
+        Me.mSpacing.Append(y1)
+        Me.mSpacing.Append(x2)
+        Me.mSpacing.Append(y2)
+        Me.mSpacing.Append(distance)
+    End Sub
+
+    Private Function FinishPointer() As Boolean
+        If Me.mPanning Then
+            Me.mPanning = False
+            Me.mSurface.Cursor = CursorType.Default
+            Me.NotifyCommandState()
+            Return False
+        End If
+        If Me.mMarquee Then
+            Me.mMarquee = False
+            Dim tiny As Boolean = Math.Abs(Me.mMarqueeX1 - Me.mMarqueeX0) * Me.mZoom < 3.0 And Math.Abs(Me.mMarqueeY1 - Me.mMarqueeY0) * Me.mZoom < 3.0
+            Dim chosen As Array Of String = Me.SelectedIds()
+            If tiny And Not Me.mMarqueeAdditive Then
+                ' A plain click on the layout background selects the container
+                ' (the root window) so its own properties can be edited.
+                Dim root As LayoutNode = Me.mDocument.FindNode(Me.mActiveRoot)
+                chosen = []
+                If Me.mMarqueeContainer <> Me.mActiveRoot Then
+                    chosen = [Me.mMarqueeContainer]
+                ElseIf root <> Nil Then
+                    If Me.mMarqueeX0 >= 0.0 And Me.mMarqueeY0 >= 0.0 And Me.mMarqueeX0 <= Me.RootWidth() And Me.mMarqueeY0 <= Me.RootHeight() Then chosen = [root.Id]
+                End If
+            End If
+            Me.SelectNodes(chosen)
+            Return False
+        End If
+        If Not Me.mGesture Then Return False
+        Dim moved As Boolean = Me.mMoved
+        Dim makeKey As String = Me.mMakeKeyOnRelease
+        Dim duplicate As Boolean = Me.mDuplicateDrag
+        Dim ids As Array Of String = Me.mGestureIds
+        Dim xs As Array Of Integer = Me.mPrevXs
+        Dim ys As Array Of Integer = Me.mPrevYs
+        Dim ws As Array Of Integer = Me.mPrevWs
+        Dim hs As Array Of Integer = Me.mPrevHs
+        Dim ox As Array Of Integer = Me.mOrigXs
+        Dim oy As Array Of Integer = Me.mOrigYs
+        Dim ow As Array Of Integer = Me.mOrigWs
+        Dim oh As Array Of Integer = Me.mOrigHs
+        Dim version As Integer = Me.mGestureVersion
+        Me.mGesture = False
+        Me.mGuides = []
+        Me.mSpacing = []
+        Me.RelationGuides = JSONItem.NewArray()
+        Me.mSurface.Invalidate()
+        If Me.mHost = Nil Or Me.mDocument = Nil Then Return False
+        If version <> Me.mDocument.Version Then Return False
+        Dim changed As Boolean = False
+        For i As Integer = 0 To Array.Count(ids) - 1
+            If xs(i) <> ox(i) Or ys(i) <> oy(i) Or ws(i) <> ow(i) Or hs(i) <> oh(i) Then changed = True
+        Next
+        If Not changed Then
+            If makeKey <> "" And Not moved Then
+                Dim reordered As Array Of String = []
+                reordered.Append(makeKey)
+                For Each id As String In Me.mSelection
+                    If id <> makeKey Then reordered.Append(id)
+                Next
+                Me.SelectNodes(reordered)
+            End If
+            Return False
+        End If
+        If duplicate And Not Me.mResize Then Return Me.DuplicateAt(ids, xs(0) - ox(0), ys(0) - oy(0))
+        Dim edits As Array Of EditorEdit = []
+        Try
+            For i As Integer = 0 To Array.Count(ids) - 1
+                If xs(i) = ox(i) And ys(i) = oy(i) And ws(i) = ow(i) And hs(i) = oh(i) Then Continue For
+                For Each edit As EditorEdit In Me.mDocument.FrameEdits(ids(i), xs(i), ys(i), ws(i), hs(i))
+                    edits.Append(edit)
+                Next
+            Next
+        Catch e As InvalidArgumentException
+            Me.Status(e.Message)
+            Return False
+        End Try
+        Return Me.Submit(version, edits)
+    End Function
+
+    Public Sub CancelGesture()
+        Dim wasMarquee As Boolean = Me.mMarquee
+        Me.mGesture = False
+        Me.mMarquee = False
+        Me.mPanning = False
+        Me.mMoved = False
+        Me.mDuplicateDrag = False
+        Me.mGuides = []
+        Me.mSpacing = []
+        Me.RelationGuides = JSONItem.NewArray()
+        Me.mPreviewX = Me.mOriginalX
+        Me.mPreviewY = Me.mOriginalY
+        Me.mPreviewW = Me.mOriginalW
+        Me.mPreviewH = Me.mOriginalH
+        Me.mSurface.Invalidate()
+        ' A cancelled marquee keeps its live picks; tell the host and inspector.
+        If wasMarquee Then Me.SelectNodes(Me.SelectedIds())
+    End Sub
+
+    ' ------------------------------------------------------------- keyboard
+
+    ''' Keyboard entry point used by the surface (also usable by hosts/tests).
+    ''' Returns True when the key was handled.
+    Public Function KeyPressed(key As KeyName, character As Integer, shift As Boolean, option As Boolean, primary As Boolean) As Boolean
+        If key = KeyName.Space Then
+            If Not Me.mSpaceDown Then
+                Me.mSpaceDown = True
+                If Not Me.mGesture Then Me.mSurface.Cursor = CursorType.HandOpen
+            End If
+            Return True
+        End If
+        Select Case key
+            Case KeyName.Escape
+                If Me.mGesture Or Me.mMarquee Or Me.mPanning Then
+                    Me.CancelGesture()
+                ElseIf Me.mPlacementArmed Then
+                    Me.DisarmPlacement()
+                    Me.Status("Placement cancelled.")
+                ElseIf Me.mFocusContainer <> "" Then
+                    Dim container As String = Me.mFocusContainer
+                    Me.mFocusContainer = ""
+                    Me.SelectNode(container)
+                Else
+                    Me.SelectNodes(Me.NoIds())
+                End If
+                Return True
+            Case KeyName.Left
+                Return Me.KeyboardNudge(-1, 0, shift)
+            Case KeyName.Right
+                Return Me.KeyboardNudge(1, 0, shift)
+            Case KeyName.Up
+                Return Me.KeyboardNudge(0, -1, shift)
+            Case KeyName.Down
+                Return Me.KeyboardNudge(0, 1, shift)
+            Case KeyName.Delete, KeyName.Backspace
+                If primary Or option Then Return False
+                Return Me.PerformCommand("delete")
+            Case KeyName.Return
+                If Me.CurrentNode() = Nil Then Return False
+                Me.FlushNudge()
+                Me.FocusPrimaryProperty()
+                Return True
+            Case KeyName.Tab
+                Return Me.CycleSelection(shift)
+        End Select
+        If key <> KeyName.Other Then Return False
+        If primary Then
+            Select Case character
+                Case 43, 61
+                    Return Me.PerformCommand("zoom-in")
+                Case 45, 95
+                    Return Me.PerformCommand("zoom-out")
+                Case 48
+                    Return Me.PerformCommand("zoom-actual")
+                Case 57
+                    Return Me.PerformCommand("zoom-fit")
+                Case 1, 65, 97
+                    If shift Then Return Me.PerformCommand("deselect")
+                    Return Me.PerformCommand("select-all")
+                Case 3, 67, 99
+                    Return Me.PerformCommand("copy")
+                Case 24, 88, 120
+                    Return Me.PerformCommand("cut")
+                Case 22, 86, 118
+                    Return Me.PerformCommand("paste")
+                Case 4, 68, 100
+                    Return Me.PerformCommand("duplicate")
+            End Select
+        End If
+        Return False
+    End Function
+
+    Public Sub KeyReleased(key As KeyName)
+        If key = KeyName.Space Then
+            Me.mSpaceDown = False
+            If Not Me.mPanning Then Me.mSurface.Cursor = CursorType.Default
+            Return
+        End If
+        If key = KeyName.Left Or key = KeyName.Right Or key = KeyName.Up Or key = KeyName.Down Then Me.FlushNudge()
+    End Sub
+
+    Private Function NudgeStep(large As Boolean) As Integer
+        If Not large Then Return 1
+        If Me.mSnapToGrid Then Return Me.EffectiveGrid()
+        Return 10
+    End Function
+
+    ''' Accumulates arrow-key nudges into a live preview; one commit follows on
+    ''' key release, after a short idle period, or before any other action.
+    Private Function KeyboardNudge(dx As Integer, dy As Integer, large As Boolean) As Boolean
+        If Me.mGesture Or Me.mMarquee Then Return True
+        If Me.mDocument = Nil Or Me.mHost = Nil Then Return False
+        Dim ids As Array Of String = Me.NudgeSelection()
+        If Array.Count(ids) = 0 Then Return False
+        Dim same As Boolean = Me.mNudgeVersion = Me.mDocument.Version And Array.Count(ids) = Array.Count(Me.mNudgeIds)
+        If same Then
+            For Each id As String In ids
+                If Not Array.Contains(Me.mNudgeIds, id) Then same = False
+            Next
+        End If
+        If Not same Then
+            Me.FlushNudge()
+            Me.mNudgeIds = ids
+            Me.mNudgeVersion = Me.mDocument.Version
+            Me.mNudgeDX = 0
+            Me.mNudgeDY = 0
+        End If
+        Dim amount As Integer = Me.NudgeStep(large)
+        Me.mNudgeDX += dx * amount
+        Me.mNudgeDY += dy * amount
+        Me.mNudgeTimer.Owner = Me
+        Me.mNudgeTimer.Period = 450
+        Me.mNudgeTimer.Count = 1
+        Me.mNudgeTimer.Start()
+        Me.mGuides = []
+        Me.mSpacing = []
+        If Me.mShowSpacing Then
+            Dim reference As LayoutNode = Me.mDocument.FindNode(ids(0))
+            If reference <> Nil Then
+                Dim keepIds As Array Of String = Me.mGestureIds
+                Me.mGestureIds = ids
+                Me.CollectGuideTargets(reference)
+                Me.mGestureIds = keepIds
+                Me.ComputeSpacing(Me.MovingBounds(ids))
+            End If
+        End If
+        Me.mSurface.Invalidate()
+        Return True
+    End Function
+
+    ''' Timer callback; commits an accumulated keyboard nudge.
+    Public Sub CommitPendingNudge()
+        Me.FlushNudge()
+    End Sub
+
+    Private Sub FlushNudge()
+        If Array.Count(Me.mNudgeIds) = 0 Then Return
+        Dim ids As Array Of String = Me.mNudgeIds
+        Dim dx As Integer = Me.mNudgeDX
+        Dim dy As Integer = Me.mNudgeDY
+        Dim version As Integer = Me.mNudgeVersion
+        Me.DiscardNudge()
+        If dx = 0 And dy = 0 Then Return
+        If Me.mDocument = Nil Or Me.mHost = Nil Then Return
+        If Me.mDocument.Version <> version Then Return
+        Me.CommitNudge(ids, dx, dy)
+    End Sub
+
+    Private Sub DiscardNudge()
+        Me.mNudgeTimer.Stop()
+        Me.mNudgeIds = []
+        Me.mNudgeDX = 0
+        Me.mNudgeDY = 0
+        Me.mNudgeVersion = -1
+        Me.mSpacing = []
+        Me.mSurface.Invalidate()
+    End Sub
+
+    Private Function CycleSelection(backwards As Boolean) As Boolean
+        If Me.mDocument = Nil Or Me.mActiveRoot = "" Then Return False
+        Me.FlushNudge()
+        Dim parentId As String = Me.mActiveRoot
+        Dim current As LayoutNode = Me.CurrentNode()
+        If current <> Nil Then
+            If current.ParentId <> "" Then parentId = current.ParentId
+        End If
+        Dim peers As Array Of String = []
+        For Each node As LayoutNode In Me.mDocument.Nodes
+            If node.ParentId = parentId And Me.IsCanvasNode(node) Then peers.Append(node.Id)
+        Next
+        If Array.Count(peers) = 0 Then Return False
+        Dim index As Integer = -1
+        For i As Integer = 0 To Array.Count(peers) - 1
+            If current <> Nil Then
+                If peers(i) = current.Id Then index = i
+            End If
+        Next
+        If backwards Then
+            index -= 1
+            If index < 0 Then index = Array.Count(peers) - 1
+        Else
+            index += 1
+            If index >= Array.Count(peers) Then index = 0
+        End If
+        Me.SelectNode(peers(index))
+        Return True
+    End Function
+
+    ' ----------------------------------------------------------- painting
+
+    Private Function Rgb(r As Integer, g As Integer, b As Integer) As Color
+        Return Color.FromBytes(r, g, b)
+    End Function
+
+    Private Function AccentColor() As Color
+        If Me.mPaintDark Then Return Me.Rgb(95, 208, 185)
+        Return Me.Rgb(15, 118, 110)
+    End Function
+
+    Private Function GuideColor() As Color
+        If Me.mPaintDark Then Return Me.Rgb(243, 138, 181)
+        Return Me.Rgb(214, 51, 108)
+    End Function
+
+    Private Function LineColor() As Color
+        If Me.mPaintDark Then Return Me.Rgb(44, 51, 60)
+        Return Me.Rgb(225, 229, 234)
+    End Function
+
+    Private Function InkColor() As Color
+        If Me.mPaintDark Then Return Me.Rgb(228, 232, 237)
+        Return Me.Rgb(27, 33, 41)
+    End Function
+
+    Private Function MutedColor() As Color
+        If Me.mPaintDark Then Return Me.Rgb(162, 172, 184)
+        Return Me.Rgb(91, 101, 115)
+    End Function
+
+    Private Sub SetLiteralValue(values As JSONItem, name As String, expression As String)
+        Dim raw As String = String.Trim(expression)
+        ' An unknown source expression overrides a default without evaluating it.
+        values.Remove(name)
+        Dim parsed As Optional Of JSONItem = Json.TryParse(raw)
+        If parsed.HasValue Then
+            If parsed.Value.IsString() Or parsed.Value.IsNumber() Or parsed.Value.IsBoolean() Then values.Value(name) = parsed.Value
+        ElseIf raw = "True" Or raw = "False" Then
+            values.Value(name) = raw = "True"
+        End If
+    End Sub
+
+    ''' Renderer context contains typed literal/default primitive keys. The reserved
+    ''' $expressions object contains EXACT source expressions for existing assignments
+    ''' only, including enums and unsupported expressions. Absence there means a
+    ''' typed key is a descriptor default preview. Nothing in this context is evaluated.
+    Public Function RendererValuesFor(nodeId As String) As JSONItem
+        Dim values As JSONItem = JSONItem.NewObject()
+        values.Value("$appearance") = Me.EffectiveCanvasAppearance
+        Dim expressions As JSONItem = JSONItem.NewObject()
+        values.Value("$expressions") = expressions
+        If Me.mDocument = Nil Then Return values
+        Dim node As LayoutNode = Me.mDocument.FindNode(nodeId)
+        If node = Nil Then Return values
+        Dim descriptor As LayoutControlDescriptor = Me.ResolveDescriptor(node.TypeName)
+        If descriptor <> Nil Then
+            For Each prop As LayoutPropertyDescriptor In descriptor.Properties
+                Me.SetLiteralValue(values, prop.Name, prop.DefaultExpression)
+            Next
+        End If
+        For Each prop As LayoutProperty In node.Properties
+            expressions.Value(prop.Name) = prop.RawValue
+            Me.SetLiteralValue(values, prop.Name, prop.RawValue)
+        Next
+        Return values
+    End Function
+
+    Private Function DisplayText(values As JSONItem, name As String, fallback As String) As String
+        Dim literal As Optional Of String = values.Value(name).AsString()
+        If literal.HasValue Then Return literal.Value
+        Return values.Value("$expressions").Value(name).AsString().Or(fallback)
+    End Function
+
+    ' OS-drawn snapshots of detached system controls where the platform supports
+    ' them (LayoutCanvasNative), else deliberate canvas approximations; never
+    ' source-created native runtime controls.
+    Private Sub PaintBuiltin(g As IGraphics, node As LayoutNode, x As Double, y As Double, w As Double, h As Double, values As JSONItem)
+        If Me.mNativePainter.Paint(g, node.TypeName, node.Name, x, y, w, h, values, Me.mPaintDark, Me.mZoom) Then Return
+        g.Save()
+        Try
+            g.ClipToRect(x, y, w, h)
+            Dim textColor As Color = Color.Black
+            Dim fieldColor As Color = Color.White
+            Dim borderColor As Color = Me.Rgb(170, 176, 186)
+            Dim buttonColor As Color = Me.Rgb(246, 247, 249)
+            Dim buttonEdge As Color = Me.Rgb(200, 205, 212)
+            Dim accentColor As Color = Me.AccentColor()
+            Dim mutedColor As Color = Me.MutedColor()
+            If Me.mPaintDark Then
+                textColor = Color.RGB(0.94, 0.95, 0.97)
+                fieldColor = Color.RGB(0.20, 0.21, 0.24)
+                borderColor = Color.RGB(0.55, 0.58, 0.63)
+                buttonColor = Color.RGB(0.25, 0.27, 0.30)
+                buttonEdge = Color.RGB(0.38, 0.41, 0.45)
+            End If
+            Dim baseline As Double = y + h / 2.0 + 4.0
+            Dim lineColor As Color = Me.LineColor()
+            Select Case node.TypeName
+                Case "Button"
+                    g.FillRoundedRect(x + 0.5, y + 1.5, w - 1.0, h - 1.5, 6.0, Color.RGBA(0.0, 0.0, 0.0, 0.08))
+                    g.FillRoundedRect(x + 0.5, y + 0.5, w - 1.0, h - 1.5, 6.0, buttonColor)
+                    g.StrokeRoundedRect(x + 0.5, y + 0.5, w - 1.0, h - 1.5, 6.0, 1.0, buttonEdge)
+                    Dim caption As String = Me.DisplayText(values, "Caption", node.Name)
+                    Dim textWidth As Double = g.MeasureStringWidth(caption, "", 12.0)
+                    g.DrawString(caption, x + Math.Max(4.0, (w - textWidth) / 2.0), baseline, "", 12.0, textColor)
+                Case "Label"
+                    g.DrawString(Me.DisplayText(values, "Text", node.Name), x + 2.0, baseline, "", 12.0, textColor)
+                Case "TextField", "ComboBox", "PopupMenu", "DateTimePicker", "SearchField"
+                    g.FillRoundedRect(x + 0.5, y + 0.5, w - 1.0, h - 1.0, 4.0, fieldColor)
+                    g.StrokeRoundedRect(x + 0.5, y + 0.5, w - 1.0, h - 1.0, 4.0, 1.0, borderColor)
+                    Dim text As String = Me.DisplayText(values, "Text", "")
+                    If node.TypeName = "DateTimePicker" And text = "" Then text = "2026-01-01  09:41"
+                    If text = "" Then
+                        g.DrawString(Me.DisplayText(values, "Placeholder", ""), x + 6.0, baseline, "", 12.0, mutedColor)
+                    Else
+                        g.DrawString(text, x + 6.0, baseline, "", 12.0, textColor)
+                    End If
+                    Dim cx As Double = x + w - 14.0
+                    Dim cy As Double = y + h / 2.0
+                    If node.TypeName = "ComboBox" Or node.TypeName = "PopupMenu" Then
+                        g.DrawLine(cx - 4.0, cy - 2.0, cx, cy + 2.0, 1.5, mutedColor)
+                        g.DrawLine(cx, cy + 2.0, cx + 4.0, cy - 2.0, 1.5, mutedColor)
+                    ElseIf node.TypeName = "DateTimePicker" Then
+                        g.StrokeRect(cx - 5.0, cy - 5.0, 10.0, 10.0, 1.0, mutedColor)
+                        g.DrawLine(cx - 5.0, cy - 2.0, cx + 5.0, cy - 2.0, 1.0, mutedColor)
+                    End If
+                Case "TextArea", "HTMLView"
+                    g.FillRect(x, y, w, h, fieldColor)
+                    g.StrokeRect(x + 0.5, y + 0.5, w - 1.0, h - 1.0, 1.0, borderColor)
+                    If node.TypeName = "HTMLView" Then
+                        g.FillRect(x + 1.0, y + 1.0, w - 2.0, 18.0, lineColor)
+                        g.DrawString("HTML", x + 6.0, y + 14.0, "", 10.0, mutedColor)
+                        For row As Integer = 0 To 3
+                            g.FillRect(x + 10.0, y + 30.0 + row * 14.0, (w - 20.0) * (0.9 - row * 0.15), 6.0, lineColor)
+                        Next
+                    Else
+                        g.DrawString(Me.DisplayText(values, "Text", ""), x + 6.0, y + 16.0, "", 12.0, textColor)
+                        g.FillRect(x + w - 9.0, y + 3.0, 5.0, Math.Max(8.0, h * 0.3), lineColor)
+                    End If
+                Case "Checkbox"
+                    Dim boxY As Double = y + Math.Max(0.0, (h - 14.0) / 2.0)
+                    g.FillRoundedRect(x + 1.0, boxY, 14.0, 14.0, 3.0, fieldColor)
+                    g.StrokeRoundedRect(x + 1.0, boxY, 14.0, 14.0, 3.0, 1.0, borderColor)
+                    Dim state As String = values.Value("$expressions").Value("Value").AsString().Or("Checkbox.CheckState.False")
+                    If state = "Checkbox.CheckState.True" Or state = "True" Then
+                        g.DrawLine(x + 4.0, boxY + 7.0, x + 7.0, boxY + 11.0, 2.0, accentColor)
+                        g.DrawLine(x + 7.0, boxY + 11.0, x + 13.0, boxY + 3.0, 2.0, accentColor)
+                    ElseIf state = "Checkbox.CheckState.Indeterminate" Then
+                        g.DrawLine(x + 4.0, boxY + 7.0, x + 12.0, boxY + 7.0, 2.0, accentColor)
+                    End If
+                    g.DrawString(Me.DisplayText(values, "Caption", node.Name), x + 22.0, baseline, "", 12.0, textColor)
+                Case "RadioGroup", "RadioButton"
+                    Dim rowCount As Integer = Math.Floor(h / 22.0)
+                    Dim rows As Integer = Math.Max(1, Math.Min(4, rowCount))
+                    If node.TypeName = "RadioButton" Then rows = 1
+                    For row As Integer = 0 To rows - 1
+                        Dim ry As Double = y + 4.0 + row * 22.0
+                        If node.TypeName = "RadioButton" Then ry = y + Math.Max(0.0, (h - 14.0) / 2.0)
+                        g.BeginPath()
+                        g.FillOval(x + 2.0, ry, 14.0, 14.0, fieldColor)
+                        g.BeginPath()
+                        g.StrokeOval(x + 2.0, ry, 14.0, 14.0, 1.0, borderColor)
+                        If row = 0 Then
+                            g.BeginPath()
+                            g.FillOval(x + 6.0, ry + 4.0, 6.0, 6.0, accentColor)
+                        End If
+                        Dim caption As String = "Option " + String.From(row + 1)
+                        If node.TypeName = "RadioButton" Then caption = Me.DisplayText(values, "Caption", node.Name)
+                        g.DrawString(caption, x + 22.0, ry + 11.5, "", 12.0, textColor)
+                    Next
+                Case "DisclosureTriangle"
+                    Dim cx As Double = x + w / 2.0
+                    Dim cy As Double = y + h / 2.0
+                    g.BeginPath()
+                    g.MoveTo(cx - 4.0, cy - 5.0)
+                    g.LineTo(cx + 5.0, cy)
+                    g.LineTo(cx - 4.0, cy + 5.0)
+                    g.ClosePath()
+                    g.FillPath(mutedColor)
+                Case "Slider", "ProgressBar"
+                    Dim trackY As Double = y + h / 2.0 - 3.0
+                    g.FillRoundedRect(x + 2.0, trackY, w - 4.0, 6.0, 3.0, lineColor)
+                    g.FillRoundedRect(x + 2.0, trackY, (w - 4.0) * 0.4, 6.0, 3.0, accentColor)
+                    If node.TypeName = "Slider" Then
+                        g.BeginPath()
+                        g.FillOval(x + 2.0 + (w - 4.0) * 0.4 - 7.0, y + h / 2.0 - 7.0, 14.0, 14.0, fieldColor)
+                        g.BeginPath()
+                        g.StrokeOval(x + 2.0 + (w - 4.0) * 0.4 - 7.0, y + h / 2.0 - 7.0, 14.0, 14.0, 1.0, borderColor)
+                    End If
+                Case "Stepper"
+                    g.FillRoundedRect(x + 0.5, y + 0.5, w - 1.0, h - 1.0, 4.0, buttonColor)
+                    g.StrokeRoundedRect(x + 0.5, y + 0.5, w - 1.0, h - 1.0, 4.0, 1.0, buttonEdge)
+                    g.DrawLine(x + 2.0, y + h / 2.0, x + w - 2.0, y + h / 2.0, 1.0, buttonEdge)
+                    Dim sx As Double = x + w / 2.0
+                    g.DrawLine(sx - 3.0, y + h * 0.3, sx, y + h * 0.2, 1.5, mutedColor)
+                    g.DrawLine(sx, y + h * 0.2, sx + 3.0, y + h * 0.3, 1.5, mutedColor)
+                    g.DrawLine(sx - 3.0, y + h * 0.7, sx, y + h * 0.8, 1.5, mutedColor)
+                    g.DrawLine(sx, y + h * 0.8, sx + 3.0, y + h * 0.7, 1.5, mutedColor)
+                Case "View"
+                    g.FillRect(x, y, w, h, fieldColor)
+                    g.StrokeRect(x + 0.5, y + 0.5, w - 1.0, h - 1.0, 1.0, lineColor)
+                    g.DrawString(node.Name, x + 4.0, y + 12.0, "", 10.0, mutedColor)
+                Case "GroupBox"
+                    Dim title As String = Me.DisplayText(values, "Caption", node.Name)
+                    g.StrokeRoundedRect(x + 0.5, y + 8.5, w - 1.0, h - 9.0, 5.0, 1.0, borderColor)
+                    Dim titleWidth As Double = g.MeasureStringWidth(title, "", 11.0)
+                    Dim backdrop As Color = Color.White
+                    If Me.mPaintDark Then backdrop = Me.Rgb(30, 34, 40)
+                    g.FillRect(x + 8.0, y, titleWidth + 8.0, 16.0, backdrop)
+                    g.DrawString(title, x + 12.0, y + 12.0, "", 11.0, textColor)
+                Case "TabView", "PagePanel"
+                    Dim top As Double = y
+                    If node.TypeName = "TabView" Then top = y + 12.0
+                    g.FillRoundedRect(x + 0.5, top + 0.5, w - 1.0, h - (top - y) - 1.0, 5.0, Color.RGBA(0.5, 0.5, 0.5, 0.06))
+                    g.StrokeRoundedRect(x + 0.5, top + 0.5, w - 1.0, h - (top - y) - 1.0, 5.0, 1.0, borderColor)
+                    If node.TypeName = "TabView" Then
+                        Dim tabW As Double = Math.Min(80.0, (w - 20.0) / 3.0)
+                        Dim tx As Double = x + (w - tabW * 3.0) / 2.0
+                        For tab As Integer = 0 To 2
+                            Dim fill As Color = buttonColor
+                            If tab = 0 Then fill = accentColor
+                            g.FillRect(tx + tab * tabW, y + 2.0, tabW, 20.0, fill)
+                            g.StrokeRect(tx + tab * tabW, y + 2.0, tabW, 20.0, 1.0, buttonEdge)
+                            Dim tabInk As Color = textColor
+                            If tab = 0 Then
+                                tabInk = Color.White
+                                If Me.mPaintDark Then tabInk = Me.Rgb(16, 32, 30)
+                            End If
+                            g.DrawString("Tab " + String.From(tab + 1), tx + tab * tabW + 8.0, y + 16.0, "", 11.0, tabInk)
+                        Next
+                    Else
+                        g.DrawString(node.Name + " · page 1", x + 8.0, y + 16.0, "", 11.0, mutedColor)
+                        For dot As Integer = 0 To 2
+                            Dim dotColor As Color = lineColor
+                            If dot = 0 Then dotColor = accentColor
+                            g.BeginPath()
+                            g.FillOval(x + w / 2.0 - 14.0 + dot * 12.0, y + h - 14.0, 6.0, 6.0, dotColor)
+                        Next
+                    End If
+                Case "ListBox"
+                    g.FillRect(x, y, w, h, fieldColor)
+                    g.FillRect(x, y, w, 20.0, buttonColor)
+                    g.DrawString("Column", x + 6.0, y + 14.0, "", 11.0, mutedColor)
+                    Dim rowY As Double = y + 20.0
+                    Dim index As Integer = 0
+                    While rowY < y + h
+                        If index Mod 2 = 1 Then g.FillRect(x, rowY, w, 20.0, Color.RGBA(0.5, 0.5, 0.5, 0.07))
+                        rowY += 20.0
+                        index += 1
+                    Wend
+                    g.StrokeRect(x + 0.5, y + 0.5, w - 1.0, h - 1.0, 1.0, borderColor)
+                Case "ImageView", "Canvas"
+                    g.FillRect(x, y, w, h, Color.RGBA(0.5, 0.5, 0.5, 0.08))
+                    g.StrokeRect(x + 0.5, y + 0.5, w - 1.0, h - 1.0, 1.0, borderColor)
+                    If node.TypeName = "ImageView" Then
+                        g.BeginPath()
+                        g.MoveTo(x + w * 0.2, y + h * 0.75)
+                        g.LineTo(x + w * 0.42, y + h * 0.45)
+                        g.LineTo(x + w * 0.58, y + h * 0.62)
+                        g.LineTo(x + w * 0.68, y + h * 0.52)
+                        g.LineTo(x + w * 0.82, y + h * 0.75)
+                        g.ClosePath()
+                        g.FillPath(mutedColor)
+                        g.BeginPath()
+                        g.FillOval(x + w * 0.66, y + h * 0.22, Math.Min(w, h) * 0.12, Math.Min(w, h) * 0.12, mutedColor)
+                    Else
+                        g.SetLineStyle(Graphics.LineStyle.Dash)
+                        g.DrawLine(x, y, x + w, y + h, 1.0, lineColor)
+                        g.DrawLine(x + w, y, x, y + h, 1.0, lineColor)
+                        g.SetLineStyle(Graphics.LineStyle.Solid)
+                        g.DrawString(node.Name, x + 6.0, y + 16.0, "", 11.0, mutedColor)
+                    End If
+                Case Else
+                    g.FillRect(x, y, w, h, fieldColor)
+                    g.StrokeRect(x, y, w, h, 1.0, borderColor)
+                    g.DrawString(node.Name + " : " + node.TypeName, x + 4.0, y + 16.0, "", 12.0, textColor)
+            End Select
+        Finally
+            g.Restore()
+        End Try
+    End Sub
+
+    ''' Root window chrome: shadow, title bar with the Title property and body.
+    Private Sub PaintRoot(g As Graphics, root As LayoutNode)
+        Dim w As Double = Me.RootWidth()
+        Dim h As Double = Me.RootHeight()
+        Dim chrome As Double = Me.ChromeHeight()
+        Dim body As Color = Color.White
+        Dim bar As Color = Me.Rgb(236, 239, 243)
+        If Me.mPaintDark Then
+            body = Me.Rgb(30, 34, 40)
+            bar = Me.Rgb(42, 47, 55)
+        End If
+        For i As Integer = 1 To 4
+            Dim spread As Double = i * 2.0
+            g.FillRoundedRect(-spread, -chrome - spread + 3.0, w + spread * 2.0, h + chrome + spread * 2.0, 8.0 + spread, Color.RGBA(0.0, 0.0, 0.0, 0.035))
+        Next
+        Dim values As JSONItem = Me.RendererValuesFor(root.Id)
+        If root.TypeName = "Window" Then
+            g.FillRoundedRect(0.0, -chrome, w, chrome + 8.0, 7.0, bar)
+            g.FillRect(0.0, 0.0, w, h, body)
+            Dim title As String = Me.DisplayText(values, "Title", root.Name)
+            Dim titleWidth As Double = g.MeasureStringWidth(title, "", 12.0)
+            g.DrawString(title, Math.Max(70.0, (w - titleWidth) / 2.0), -chrome / 2.0 + 4.0, "", 12.0, Me.InkColor())
+            g.FillOval(12.0, -chrome / 2.0 - 5.0, 10.0, 10.0, Me.Rgb(255, 95, 87))
+            g.FillOval(28.0, -chrome / 2.0 - 5.0, 10.0, 10.0, Me.Rgb(254, 188, 46))
+            g.FillOval(44.0, -chrome / 2.0 - 5.0, 10.0, 10.0, Me.Rgb(40, 200, 64))
+            g.StrokeRoundedRect(0.0, -chrome, w, h + chrome, 7.0, 1.0 / Me.mZoom, Me.LineColor())
+            g.DrawLine(0.0, 0.0, w, 0.0, 1.0 / Me.mZoom, Me.LineColor())
+        Else
+            g.FillRect(0.0, 0.0, w, h, body)
+            g.StrokeRect(0.0, 0.0, w, h, 1.0 / Me.mZoom, Me.LineColor())
+            g.DrawString(root.Name + " : " + root.TypeName, 0.0, -5.0, "", 11.0, Me.MutedColor())
+        End If
+        If Me.mShowGrid Then
+            g.Save()
+            g.ClipToRect(0.0, 0.0, w, h)
+            Dim gridStep As Double = Me.EffectiveGrid()
+            While gridStep * Me.mZoom < 6.0
+                gridStep = gridStep * 2.0
+            Wend
+            Dim gridColor As Color = Color.RGBA(0.0, 0.0, 0.0, 0.07)
+            If Me.mPaintDark Then gridColor = Color.RGBA(1.0, 1.0, 1.0, 0.07)
+            Dim gx As Double = gridStep
+            While gx < w
+                g.DrawLine(gx, 0.0, gx, h, 1.0 / Me.mZoom, gridColor)
+                gx += gridStep
+            Wend
+            Dim gy As Double = gridStep
+            While gy < h
+                g.DrawLine(0.0, gy, w, gy, 1.0 / Me.mZoom, gridColor)
+                gy += gridStep
+            Wend
+            g.Restore()
+        End If
+    End Sub
+
+    Public Sub PaintLayout(g As Graphics)
+        Dim nativeWindow As Window = Me.FindParentWindow()
+        If nativeWindow <> Nil Then Me.mNativePainter.BackingScaleFactor = nativeWindow.ScaleFactor
+        Dim surfaceWidth As Double = Me.mSurface.Width
+        Dim surfaceHeight As Double = Me.mSurface.Height
+        If Me.mFitPending Then Me.FitViewport()
+        Me.mPaintDark = Me.EffectiveCanvasAppearance = "dark"
+        Dim desk As Color = Me.Rgb(243, 245, 247)
+        If Me.mPaintDark Then desk = Me.Rgb(21, 24, 28)
+        g.FillRect(0.0, 0.0, Math.Max(surfaceWidth, g.Width), Math.Max(surfaceHeight, g.Height), desk)
+        If Me.mDocument = Nil Then Return
+        Dim root As LayoutNode = Me.mDocument.FindNode(Me.mActiveRoot)
+        ' Renderer failures are reported once after painting: a host callback may
+        ' detach or reload the editor, which must not happen mid-loop.
+        Dim failedTypes As Array Of String = []
+        g.Save()
+        Try
+            g.Translate(Me.mPanX, Me.mPanY)
+            g.Scale(Me.mZoom, Me.mZoom)
+            If root <> Nil Then Me.PaintRoot(g, root)
+            For Each node As LayoutNode In Me.mDocument.Nodes
+                If Not Me.IsCanvasNode(node) Then Continue For
+                Dim x As Double = Me.CanvasX(node)
+                Dim y As Double = Me.CanvasY(node)
+                Dim w As Double = Me.LocalW(node)
+                Dim h As Double = Me.LocalH(node)
+                Dim selected As Boolean = node.Id = Me.mSelected
+                g.Save()
+                Try
+                    Me.ClipAncestors(g, node)
+                    Dim values As JSONItem = Me.RendererValuesFor(node.Id)
+                    Dim renderer As LayoutRenderer = Me.ResolveRenderer(node.TypeName)
+                    Dim painted As Boolean = False
+                    If renderer <> Nil Then
+                        g.Save()
+                        Try
+                            renderer.Paint(g, x, y, w, h, values, selected)
+                            painted = True
+                        Catch e As Exception
+                            If Not Array.Contains(failedTypes, node.TypeName) Then failedTypes.Append(node.TypeName)
+                        Finally
+                            g.Restore()
+                        End Try
+                    End If
+                    If Not painted Then
+                        Me.PaintBuiltin(g, node, x, y, w, h, values)
+                    End If
+                    If Me.mShowBounds Then
+                        g.LineStyle = Graphics.LineStyle.Dot
+                        g.StrokeRect(x, y, w, h, 1.0 / Me.mZoom, Me.MutedColor())
+                        g.LineStyle = Graphics.LineStyle.Solid
+                    End If
+                Finally
+                    g.Restore()
+                End Try
+            Next
+        Finally
+            g.Restore()
+        End Try
+        Me.PaintOverlay(g)
+        Me.ReportRendererFailures(failedTypes)
+    End Sub
+
+    ''' One status message per distinct set of failing renderer types; later frames
+    ''' with the same failures stay quiet until the set changes or clears.
+    Private Sub ReportRendererFailures(failedTypes As Array Of String)
+        Dim message As String = ""
+        For Each typeName As String In failedTypes
+            If message = "" Then
+                message = "Renderer failed: " + typeName
+            Else
+                message += ", " + typeName
+            End If
+        Next
+        If message = Me.mRendererFailure Then Return
+        Me.mRendererFailure = message
+        If message <> "" Then Me.Status(message)
+    End Sub
+
+    Private Function ScreenX(x As Double) As Double
+        Return x * Me.mZoom + Me.mPanX
+    End Function
+
+    Private Function ScreenY(y As Double) As Double
+        Return y * Me.mZoom + Me.mPanY
+    End Function
+
+    ''' Selection, handles, guides, spacing, readout and marquee in screen space.
+    Private Sub PaintOverlay(g As Graphics)
+        Dim accent As Color = Me.AccentColor()
+        Dim guide As Color = Me.GuideColor()
+        Dim handleFill As Color = Color.White
+        If Me.mPaintDark Then handleFill = Me.Rgb(30, 34, 40)
+        If Me.mFocusContainer <> "" Then
+            Dim focus As LayoutNode = Me.mDocument.FindNode(Me.mFocusContainer)
+            If focus <> Nil Then
+                g.LineStyle = Graphics.LineStyle.Dash
+                g.StrokeRect(Me.ScreenX(Me.CanvasX(focus)) - 3.0, Me.ScreenY(Me.CanvasY(focus)) - 3.0, focus.Width * Me.mZoom + 6.0, focus.Height * Me.mZoom + 6.0, 1.0, accent)
+                g.LineStyle = Graphics.LineStyle.Solid
+            End If
+        End If
+        For Each id As String In Me.mSelection
+            Dim node As LayoutNode = Me.mDocument.FindNode(id)
+            If node = Nil Then Continue For
+            If node.ParentId = "" Then
+                ' The root itself: outline the whole form.
+                g.StrokeRect(Me.mPanX - 1.0, Me.mPanY - 1.0, Me.RootWidth() * Me.mZoom + 2.0, Me.RootHeight() * Me.mZoom + 2.0, 2.0, accent)
+                Continue For
+            End If
+            If Not Me.IsCanvasNode(node) Then Continue For
+            Dim sx As Double = Me.ScreenX(Me.CanvasX(node))
+            Dim sy As Double = Me.ScreenY(Me.CanvasY(node))
+            Dim sw As Double = Me.LocalW(node) * Me.mZoom
+            Dim sh As Double = Me.LocalH(node) * Me.mZoom
+            Dim key As Boolean = id = Me.mSelected
+            If Not node.Editable Then
+                ' Constrained or computed geometry: selectable, never draggable.
+                g.LineStyle = Graphics.LineStyle.Dash
+                g.StrokeRect(sx, sy, sw, sh, 1.5, Me.MutedColor())
+                g.LineStyle = Graphics.LineStyle.Solid
+                Continue For
+            End If
+            Dim strokeWidth As Double = 1.0
+            If key Then strokeWidth = 2.0
+            g.StrokeRect(sx, sy, sw, sh, strokeWidth, accent)
+            If Not Me.CanMoveNode(node) Then Continue For
+            Dim size As Double = 7.0
+            If key Then size = 8.0
+            For index As Integer = 0 To 7
+                If (index = 1 Or index = 5) And sw < 24.0 Then Continue For
+                If (index = 3 Or index = 7) And sh < 24.0 Then Continue For
+                Dim hx As Double = Me.HandlePointX(index, sx, sw) - size / 2.0
+                Dim hy As Double = Me.HandlePointY(index, sy, sh) - size / 2.0
+                If key Then
+                    g.FillRect(hx, hy, size, size, accent)
+                    g.StrokeRect(hx, hy, size, size, 1.0, handleFill)
+                Else
+                    g.FillRect(hx, hy, size, size, handleFill)
+                    g.StrokeRect(hx, hy, size, size, 1.0, accent)
+                End If
+            Next
+        Next
+        Dim guideCount As Integer = Array.Count(Me.mGuides) \ 4
+        For i As Integer = 0 To guideCount - 1
+            Dim position As Double = Me.mGuides(i * 4 + 1)
+            Dim extentFrom As Double = Me.mGuides(i * 4 + 2)
+            Dim extentTo As Double = Me.mGuides(i * 4 + 3)
+            If Me.mGuides(i * 4) = 0.0 Then
+                g.DrawLine(Me.ScreenX(position), Me.ScreenY(extentFrom) - 6.0, Me.ScreenX(position), Me.ScreenY(extentTo) + 6.0, 1.0, guide)
+            Else
+                g.DrawLine(Me.ScreenX(extentFrom) - 6.0, Me.ScreenY(position), Me.ScreenX(extentTo) + 6.0, Me.ScreenY(position), 1.0, guide)
+            End If
+        Next
+        Dim markCount As Integer = Array.Count(Me.mSpacing) \ 5
+        For i As Integer = 0 To markCount - 1
+            Dim x1 As Double = Me.ScreenX(Me.mSpacing(i * 5))
+            Dim y1 As Double = Me.ScreenY(Me.mSpacing(i * 5 + 1))
+            Dim x2 As Double = Me.ScreenX(Me.mSpacing(i * 5 + 2))
+            Dim y2 As Double = Me.ScreenY(Me.mSpacing(i * 5 + 3))
+            Dim distance As Integer = Math.Round(Me.mSpacing(i * 5 + 4))
+            Dim label As String = String.From(distance)
+            g.DrawLine(x1, y1, x2, y2, 1.0, guide)
+            If y1 = y2 Then
+                g.DrawLine(x1, y1 - 4.0, x1, y1 + 4.0, 1.0, guide)
+                g.DrawLine(x2, y2 - 4.0, x2, y2 + 4.0, 1.0, guide)
+            Else
+                g.DrawLine(x1 - 4.0, y1, x1 + 4.0, y1, 1.0, guide)
+                g.DrawLine(x2 - 4.0, y2, x2 + 4.0, y2, 1.0, guide)
+            End If
+            Me.PaintBadge(g, label, (x1 + x2) / 2.0, (y1 + y2) / 2.0, guide, True)
+        Next
+        If Me.mGesture And Me.mMoved Then
+            Dim readout As String
+            If Me.mResize Then
+                readout = String.From(Me.mPreviewW) + " × " + String.From(Me.mPreviewH)
+            Else
+                readout = "X " + String.From(Me.mPreviewX) + "  Y " + String.From(Me.mPreviewY)
+            End If
+            Me.PaintBadge(g, readout, Me.mPointerX + 18.0, Me.mPointerY + 26.0, Me.InkColor(), False)
+        End If
+        If Me.mPlacementArmed And Me.mPointerX >= 0.0 Then Me.PaintPlacementGhost(g)
+        If Me.mMarquee Then
+            Dim mx As Double = Me.ScreenX(Math.Min(Me.mMarqueeX0, Me.mMarqueeX1))
+            Dim my As Double = Me.ScreenY(Math.Min(Me.mMarqueeY0, Me.mMarqueeY1))
+            Dim mw As Double = Math.Abs(Me.mMarqueeX1 - Me.mMarqueeX0) * Me.mZoom
+            Dim mh As Double = Math.Abs(Me.mMarqueeY1 - Me.mMarqueeY0) * Me.mZoom
+            g.FillRect(mx, my, mw, mh, Color.RGBA(accent.R, accent.G, accent.B, 0.12))
+            g.StrokeRect(mx, my, mw, mh, 1.0, accent)
+        End If
+    End Sub
+
+    ''' Armed placement preview: a dashed ghost at the default size, the target
+    ''' container highlighted, and a hint badge (warning colour outside the root).
+    Private Sub PaintPlacementGhost(g As Graphics)
+        Dim x As Double = Me.DocX(Me.mPointerX)
+        Dim y As Double = Me.DocY(Me.mPointerY)
+        Dim root As LayoutNode = Me.mDocument.FindNode(Me.mActiveRoot)
+        If root = Nil Then Return
+        Dim descriptor As LayoutControlDescriptor = Me.mCatalog.Find(Me.mArmedType)
+        Dim w As Double = 100.0
+        Dim h As Double = 30.0
+        Dim label As String = Me.mArmedType
+        If descriptor <> Nil Then
+            w = descriptor.DefaultWidth
+            h = descriptor.DefaultHeight
+            label = descriptor.DisplayName
+        End If
+        Dim inside As Boolean = root.HasLiteralFrame And x >= 0.0 And y >= 0.0 And x <= root.Width And y <= root.Height
+        Dim colour As Color = Me.AccentColor()
+        Dim hint As String
+        If inside Then
+            Dim containerId As String = Me.ContainerAt(x, y)
+            Dim container As LayoutNode = Me.mDocument.FindNode(containerId)
+            Dim containerName As String = root.Name
+            If container <> Nil Then
+                containerName = container.Name
+                g.FillRect(Me.ScreenX(Me.CanvasX(container)), Me.ScreenY(Me.CanvasY(container)), Me.NodeCanvasW(container) * Me.mZoom, Me.NodeCanvasH(container) * Me.mZoom, Color.RGBA(colour.R, colour.G, colour.B, 0.06))
+                g.StrokeRect(Me.ScreenX(Me.CanvasX(container)), Me.ScreenY(Me.CanvasY(container)), Me.NodeCanvasW(container) * Me.mZoom, Me.NodeCanvasH(container) * Me.mZoom, 2.0, colour)
+            End If
+            hint = "Place " + label + " in " + containerName + " · Esc"
+        Else
+            colour = Me.GuideColor()
+            hint = "Click inside " + root.Name + " to place " + label + " · Esc"
+        End If
+        Dim gx As Double = Me.mPointerX
+        Dim gy As Double = Me.mPointerY
+        If inside And Me.mSnapToGrid Then
+            gx = Me.ScreenX(Me.Snap(Math.Round(x)))
+            gy = Me.ScreenY(Me.Snap(Math.Round(y)))
+        End If
+        g.FillRect(gx, gy, w * Me.mZoom, h * Me.mZoom, Color.RGBA(colour.R, colour.G, colour.B, 0.10))
+        g.LineStyle = Graphics.LineStyle.Dash
+        g.StrokeRect(gx, gy, w * Me.mZoom, h * Me.mZoom, 1.0, colour)
+        g.LineStyle = Graphics.LineStyle.Solid
+        Me.PaintBadge(g, hint, gx, gy + h * Me.mZoom + 6.0, colour, False)
+    End Sub
+
+    Private Sub PaintBadge(g As Graphics, text As String, cx As Double, cy As Double, fill As Color, centred As Boolean)
+        Dim textWidth As Double = g.MeasureStringWidth(text, "", 10.0)
+        Dim w As Double = textWidth + 10.0
+        Dim h As Double = 16.0
+        Dim x As Double = cx
+        Dim y As Double = cy
+        If centred Then
+            x = cx - w / 2.0
+            y = cy - h / 2.0
+        End If
+        g.FillRoundedRect(x, y, w, h, 4.0, fill)
+        Dim ink As Color = Color.White
+        If Me.mPaintDark Then ink = Me.Rgb(21, 24, 28)
+        g.DrawString(text, x + 5.0, y + 11.5, "", 10.0, ink)
+    End Sub
+
+    Private Function ResolveRenderer(typeName As String) As LayoutRenderer
+        Dim descriptor As LayoutControlDescriptor = Me.ResolveDescriptor(typeName)
+        If descriptor <> Nil Then Return Me.mCatalog.RendererFor(descriptor.TypeName)
+        Return Me.mCatalog.RendererFor(typeName)
+    End Function
+
+    ' ---------------------------------------------------------- placement
+
+    Public Sub ArmPlacement(typeName As String, controlName As String)
+        Me.CancelGesture()
+        Me.mPlacementArmed = True
+        Me.mArmedType = typeName
+        Me.mArmedName = controlName
+        Me.mSurface.Cursor = CursorType.Crosshair
+        ' The palette derives its armed item from this state.
+        Me.mPaletteList.Invalidate()
+        Me.Status("Click on the canvas to place " + controlName + ".")
+    End Sub
+
+    Public Sub DisarmPlacement()
+        Me.mPlacementArmed = False
+        Me.mArmedType = ""
+        Me.mArmedName = ""
+        Me.mSurface.Cursor = CursorType.Default
+        Me.mPaletteList.Invalidate()
+    End Sub
+
+    Public Property PlacementArmed As Boolean
+        Get
+            Return Me.mPlacementArmed
+        End Get
+    End Property
+
+    Private Sub PlaceControl(screenX As Double, screenY As Double)
+        Dim typeName As String = Me.mArmedType
+        Dim controlName As String = Me.mArmedName
+        Me.DisarmPlacement()
+        If Me.mDocument = Nil Or Me.mHost = Nil Or Me.mActiveRoot = "" Then Return
+        Dim x As Double = Me.DocX(screenX)
+        Dim y As Double = Me.DocY(screenY)
+        Dim root As LayoutNode = Me.mDocument.FindNode(Me.mActiveRoot)
+        If root = Nil Then Return
+        If Not root.HasLiteralFrame Or x < 0.0 Or y < 0.0 Or x > root.Width Or y > root.Height Then
+            Me.Status("Click inside the layout bounds to place a control.")
+            Return
+        End If
+        ' The suggested name may have been taken since arming (for example by a redo).
+        If Me.ControlNameTaken(controlName) Then controlName = Me.SuggestName(typeName)
+        Me.InsertAtCanvasPoint(typeName, controlName, x, y)
+    End Sub
+
+    ''' Inserts a control with its top-left at a canvas point, inside the deepest
+    ''' View container there (or the active root).
+    Private Function InsertAtCanvasPoint(typeName As String, controlName As String, x As Double, y As Double) As Boolean
+        Dim parentId As String = Me.ContainerAt(x, y)
+        Dim parentX As Double = 0.0
+        Dim parentY As Double = 0.0
+        Dim parent As LayoutNode = Me.mDocument.FindNode(parentId)
+        If parent <> Nil Then
+            If parent.ParentId <> "" Then
+                parentX = Me.CanvasX(parent)
+                parentY = Me.CanvasY(parent)
+            End If
+        End If
+        Dim insertX As Integer = Math.Max(0, Math.Round(x - parentX))
+        Dim insertY As Integer = Math.Max(0, Math.Round(y - parentY))
+        If Me.mSnapToGrid Then
+            insertX = Me.Snap(insertX)
+            insertY = Me.Snap(insertY)
+        End If
+        Dim descriptor As LayoutControlDescriptor = Me.mCatalog.Find(typeName)
+        Dim insertW As Integer = 100
+        Dim insertH As Integer = 30
+        If descriptor <> Nil Then
+            insertW = descriptor.DefaultWidth
+            insertH = descriptor.DefaultHeight
+        End If
+        Return Me.InsertControl(parentId, typeName, controlName, insertX, insertY, insertW, insertH)
+    End Function
+
+    Private Sub BuildStage()
+        Me.mSurface.Owner = Me
+        Me.mSurface.Focusable = True
+        Me.mSurface.AccessibleRole = AccessibleRole.Group
+        Me.mSurface.AccessibleLabel = "Layout design canvas"
+        Me.mSurface.AccessibleHint = "Tab and Shift+Tab select controls. Arrow keys move the selection, Shift+Arrow moves farther, Return edits properties, and Escape clears selection."
+        Me.mNudgeTimer.Owner = Me
+        Me.mStagePane.AddSubview(Me.mSurface)
+    End Sub
+
+    Private Sub UpdateStageAccessibility()
+        Dim label As String = "Layout design canvas"
+        Dim count As Integer = Array.Count(Me.mSelection)
+        If count = 1 Then
+            Dim selected As LayoutNode = Me.CurrentNode()
+            If selected <> Nil Then label += ": " + selected.Name + ", " + selected.TypeName + " selected"
+        ElseIf count > 1 Then
+            label += ": " + String.From(count) + " controls selected"
+        Else
+            label += ": no control selected"
+        End If
+        If Me.mSurface.AccessibleLabel <> label Then
+            Me.mSurface.AccessibleLabel = label
+            Me.mSurface.NotifyAccessibilityChanged()
+        End If
+    End Sub
+
+    Private Sub LayoutStageArea(x As Integer, y As Integer, width As Integer, height As Integer)
+        Me.mSurface.Move(x, y, Math.Max(1, width), Math.Max(1, height))
+        If Me.mFitPending Then Me.FitViewport()
+    End Sub
+End Class

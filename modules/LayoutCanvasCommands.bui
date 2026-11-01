@@ -1,0 +1,913 @@
+Import editorkit
+Import layoutkit.LayoutDocument
+Import layoutkit.LayoutCatalog
+Import layoutkit.LayoutRefactor
+Import layoutkit.LayoutRelations
+
+' Editor commands: the PerformCommand/CanPerformCommand/CommandChecked dispatcher,
+' clipboard, arrangement (align, distribute, spacing, size, order, embed),
+' nudges and the surface's contextual menu. Model edits come from
+' LayoutRelations/LayoutDocument; each command is one host transaction.
+
+Public Partial Class LayoutEditor
+    Private Property mAlignTarget As String = "selection"
+    Private Property mContextX As Double = 0.0
+    Private Property mContextY As Double = 0.0
+    Private Property mLastPasted As String = ""
+    Private Property mPasteCount As Integer = 0
+    ' Fallback when the system clipboard is unavailable (headless sessions).
+    Private Property mClipboardFallback As String = ""
+
+    ' ----------------------------------------------------------- selection sets
+
+    ''' Selected controls the arrangement batches accept (key object first): the
+    ''' LayoutRelations.CanArrange gate, so enablement matches execution.
+    Private Function MovableSelection() As Array Of String
+        Dim ids As Array Of String = []
+        If Me.mDocument = Nil Then Return ids
+        For Each id As String In Me.mSelection
+            If Me.CanArrangeNode(Me.mDocument.FindNode(id)) Then ids.Append(id)
+        Next
+        Return ids
+    End Function
+
+    ''' Selected controls a drag would move (key object first). Nudges use the same
+    ''' set and commit through the same per-control FrameEdits as a drag.
+    Private Function NudgeSelection() As Array Of String
+        Dim ids As Array Of String = []
+        If Me.mDocument = Nil Then Return ids
+        For Each id As String In Me.mSelection
+            If Me.CanMoveNode(Me.mDocument.FindNode(id)) Then ids.Append(id)
+        Next
+        Return ids
+    End Function
+
+    ''' Selected controls other than the root (key object first).
+    Private Function ControlSelection() As Array Of String
+        Dim ids As Array Of String = []
+        If Me.mDocument = Nil Then Return ids
+        For Each id As String In Me.mSelection
+            Dim node As LayoutNode = Me.mDocument.FindNode(id)
+            If node <> Nil Then
+                If node.ParentId <> "" Then ids.Append(id)
+            End If
+        Next
+        Return ids
+    End Function
+
+    Private Function SharedParent(ids As Array Of String) As String
+        If Array.Count(ids) = 0 Or Me.mDocument = Nil Then Return ""
+        Dim parentId As String = Me.mDocument.FindNode(ids(0)).ParentId
+        For Each id As String In ids
+            If Me.mDocument.FindNode(id).ParentId <> parentId Then Return ""
+        Next
+        Return parentId
+    End Function
+
+    Private Function CanEdit() As Boolean
+        Return Me.mDocument <> Nil And Me.mHost <> Nil And Me.mActiveRoot <> ""
+    End Function
+
+    ''' Commits edits; on a synchronous host reload the named controls are selected.
+    Private Function SubmitSelecting(version As Integer, edits As Array Of EditorEdit, names As Array Of String) As Boolean
+        Dim before As LayoutDocument = Me.mDocument
+        Me.mPendingNames = names
+        Dim accepted As Boolean = Me.Submit(version, edits)
+        ' Pending names only apply to the reload caused by this commit.
+        If Not accepted Or Me.mDocument = before Then Me.mPendingNames = []
+        Return accepted
+    End Function
+
+    ''' A fresh control name for a catalog type: the lower-cased short type name
+    ''' plus the first free number (button1, button2 ...). Names compare
+    ''' case-insensitively across the whole document.
+    Private Function SuggestName(typeName As String) As String
+        Dim parts As Array Of String = String.Split(typeName, ".")
+        Dim stem As String = String.LCase(Array.Last(parts))
+        If Me.mDocument = Nil Then Return stem + "1"
+        Dim taken As Array Of String = []
+        For Each node As LayoutNode In Me.mDocument.Nodes
+            taken.Append(String.LCase(node.Name))
+        Next
+        For i As Integer = 1 To 9999
+            Dim candidate As String = stem + String.From(i)
+            If Not Array.Contains(taken, candidate) Then Return candidate
+        Next
+        Return stem + "X"
+    End Function
+
+    Private Function ControlNameTaken(name As String) As Boolean
+        If Me.mDocument = Nil Or name = "" Then Return False
+        Dim lowered As String = String.LCase(name)
+        For Each node As LayoutNode In Me.mDocument.Nodes
+            If String.LCase(node.Name) = lowered Then Return True
+        Next
+        Return False
+    End Function
+
+    ' --------------------------------------------------- frame-level commands
+
+    Public Function ApplyFrame(x As Integer, y As Integer, width As Integer, height As Integer) As Boolean
+        Me.FlushNudge()
+        Me.CancelGesture()
+        Dim node As LayoutNode = Me.CurrentNode()
+        If node = Nil Or Me.mHost = Nil Then Return False
+        If Not node.Editable Or Not Me.IsCanvasNode(node) Or width < 1 Or height < 1 Then Return False
+        Return Me.Submit(Me.mDocument.Version, Me.mDocument.FrameEdits(node.Id, x, y, width, height))
+    End Function
+
+    ''' Hosts may provide their own multi-selection UI; each command is one undo
+    ''' transaction. The first id is the alignment reference.
+    Public Function AlignNodes(nodeIds As Array Of String, mode As String) As Boolean
+        nodeIds = Me.FlushNudgeKeepingAll(nodeIds)
+        Me.CancelGesture()
+        If Me.mDocument = Nil Or Me.mHost = Nil Then Return False
+        For Each id As String In nodeIds
+            Dim node As LayoutNode = Me.mDocument.FindNode(id)
+            If node = Nil Then Return False
+            If Not Me.InActiveRoot(node) Then Return False
+        Next
+        Dim edits As Array Of EditorEdit = []
+        Try
+            edits = LayoutRelations.AlignEdits(Me.mDocument, nodeIds, mode)
+        Catch e As InvalidArgumentException
+            Me.Status(e.Message)
+            Return False
+        End Try
+        Return Me.Submit(Me.mDocument.Version, edits)
+    End Function
+
+    Public Function DistributeNodes(nodeIds As Array Of String, axis As String) As Boolean
+        nodeIds = Me.FlushNudgeKeepingAll(nodeIds)
+        Me.CancelGesture()
+        If Me.mDocument = Nil Or Me.mHost = Nil Then Return False
+        For Each id As String In nodeIds
+            Dim node As LayoutNode = Me.mDocument.FindNode(id)
+            If node = Nil Then Return False
+            If Not Me.InActiveRoot(node) Then Return False
+        Next
+        Dim edits As Array Of EditorEdit = []
+        Try
+            edits = LayoutRelations.DistributeEdits(Me.mDocument, nodeIds, axis)
+        Catch e As InvalidArgumentException
+            Me.Status(e.Message)
+            Return False
+        End Try
+        Return Me.Submit(Me.mDocument.Version, edits)
+    End Function
+
+    ''' Commits a nudge exactly like a drag: one transaction of per-control
+    ''' FrameEdits, so any control a drag can move can also be nudged.
+    Private Function CommitNudge(ids As Array Of String, dx As Integer, dy As Integer) As Boolean
+        If Not Me.CanEdit() Or Array.Count(ids) = 0 Then Return False
+        If dx = 0 And dy = 0 Then Return False
+        Dim edits As Array Of EditorEdit = []
+        Try
+            For Each id As String In ids
+                Dim node As LayoutNode = Me.mDocument.FindNode(id)
+                If Not Me.CanMoveNode(node) Then Continue For
+                For Each edit As EditorEdit In Me.mDocument.FrameEdits(id, node.X + dx, node.Y + dy, node.Width, node.Height)
+                    edits.Append(edit)
+                Next
+            Next
+        Catch e As InvalidArgumentException
+            Me.Status(e.Message)
+            Return False
+        End Try
+        Return Me.Submit(Me.mDocument.Version, edits)
+    End Function
+
+    Private Function CenterInParent(horizontal As Boolean) As Boolean
+        Dim ids As Array Of String = Me.MovableSelection()
+        If Array.Count(ids) = 0 Then Return False
+        Dim parentId As String = Me.SharedParent(ids)
+        Dim mode As String = "vcenter"
+        If horizontal Then mode = "hcenter"
+        If parentId = "" Or Array.Count(ids) = 1 Then Return Me.CommitEdits(LayoutRelations.AlignToEdits(Me.mDocument, ids, mode, "parent"))
+        ' Several siblings move together: centre their bounding box.
+        Dim parent As LayoutNode = Me.mDocument.FindNode(parentId)
+        Dim low As Integer = 16777216
+        Dim high As Integer = -16777216
+        For Each id As String In ids
+            Dim node As LayoutNode = Me.mDocument.FindNode(id)
+            If horizontal Then
+                low = Math.Min(low, node.X)
+                high = Math.Max(high, node.X + node.Width)
+            Else
+                low = Math.Min(low, node.Y)
+                high = Math.Max(high, node.Y + node.Height)
+            End If
+        Next
+        Dim extent As Integer = Me.RootHeight()
+        If horizontal Then extent = Me.RootWidth()
+        If parent.ParentId <> "" Then
+            extent = parent.Height
+            If horizontal Then extent = parent.Width
+        End If
+        Dim delta As Integer = (extent - (high - low)) \ 2 - low
+        If delta = 0 Then Return False
+        If horizontal Then Return Me.CommitEdits(LayoutRelations.MoveByEdits(Me.mDocument, ids, delta, 0))
+        Return Me.CommitEdits(LayoutRelations.MoveByEdits(Me.mDocument, ids, 0, delta))
+    End Function
+
+    Private Function CommitEdits(edits As Array Of EditorEdit) As Boolean
+        If Array.Count(edits) = 0 Then
+            Me.Status("Nothing to change.")
+            Return False
+        End If
+        Return Me.Submit(Me.mDocument.Version, edits)
+    End Function
+
+    Private Function SizeToDefault() As Boolean
+        Dim ids As Array Of String = Me.MovableSelection()
+        If Array.Count(ids) = 0 Then Return False
+        Dim frames As JSONItem = JSONItem.NewArray()
+        For Each id As String In ids
+            Dim node As LayoutNode = Me.mDocument.FindNode(id)
+            Dim w As Integer = node.Width
+            Dim h As Integer = node.Height
+            Dim descriptor As LayoutControlDescriptor = Me.ResolveDescriptor(node.TypeName)
+            If descriptor <> Nil Then
+                w = descriptor.DefaultWidth
+                h = descriptor.DefaultHeight
+            End If
+            Dim frame As JSONItem = JSONItem.NewObject()
+            frame.Value("x") = node.X
+            frame.Value("y") = node.Y
+            frame.Value("width") = w
+            frame.Value("height") = h
+            frames.Add(frame)
+        Next
+        Return Me.CommitEdits(LayoutRelations.FramesEdits(Me.mDocument, ids, frames))
+    End Function
+
+    ' ------------------------------------------------------------- clipboard
+
+    Private Function ReadClipboardSnippet() As String
+        Dim text As String = ""
+        Try
+            Dim board As New Clipboard()
+            If board.HasText Then text = board.Text
+        Catch e As Exception
+            text = Me.mClipboardFallback
+        End Try
+        If text = "" Then text = Me.mClipboardFallback
+        If String.StartsWith(text, "' buoy-layout-snippet:") Then Return text
+        Return ""
+    End Function
+
+    ''' Cheap paste availability for command-state refreshes: an in-designer copy,
+    ''' or any text on the system clipboard. The snippet itself is read and
+    ''' validated only when paste is performed.
+    Private Function ClipboardMayHaveSnippet() As Boolean
+        If String.StartsWith(Me.mClipboardFallback, "' buoy-layout-snippet:") Then Return True
+        Try
+            Dim board As New Clipboard()
+            Return board.HasText
+        Catch e As Exception
+            Return False
+        End Try
+    End Function
+
+    Private Function CopySelection() As Boolean
+        Dim ids As Array Of String = Me.ControlSelection()
+        If Array.Count(ids) = 0 Or Me.mDocument = Nil Then Return False
+        Dim snippet As String
+        Try
+            snippet = Me.mDocument.CopySnippet(ids)
+        Catch e As InvalidArgumentException
+            Me.Status(e.Message)
+            Return False
+        End Try
+        Me.mClipboardFallback = snippet
+        Try
+            Dim board As New Clipboard()
+            board.Text = snippet
+            board.Close()
+        Catch e As Exception
+            Me.Status("System clipboard unavailable; copied inside the designer only.")
+        End Try
+        Me.mLastPasted = ""
+        Me.mPasteCount = 0
+        Dim noun As String = " controls."
+        If Array.Count(ids) = 1 Then noun = " control."
+        Me.Status("Copied " + String.From(Array.Count(ids)) + noun)
+        Me.NotifyCommandState()
+        Return True
+    End Function
+
+    ''' Container that receives pasted/inserted controls: a selected View, else the
+    ''' container under the context-menu location, else the active root.
+    Private Function PasteContainer(useLocation As Boolean) As String
+        Dim current As LayoutNode = Me.CurrentNode()
+        If current <> Nil And Not useLocation Then
+            If current.TypeName = "View" And Me.CanMoveNode(current) And current.HasLiteralFrame Then Return current.Id
+        End If
+        If useLocation Then Return Me.ContainerAt(Me.mContextX, Me.mContextY)
+        Return Me.mActiveRoot
+    End Function
+
+    Private Function PasteSnippet(snippet As String, useLocation As Boolean) As Boolean
+        If Not Me.CanEdit() Or snippet = "" Then Return False
+        Dim parentId As String = Me.PasteContainer(useLocation)
+        Dim offsetX As Integer = 10
+        Dim offsetY As Integer = 10
+        If useLocation Then
+            Dim bounds As Array Of Integer = Me.SnippetOrigin(snippet)
+            If Array.Count(bounds) = 2 Then
+                Dim parent As LayoutNode = Me.mDocument.FindNode(parentId)
+                Dim originX As Double = 0.0
+                Dim originY As Double = 0.0
+                If parent <> Nil Then
+                    If parent.ParentId <> "" Then
+                        originX = Me.CanvasX(parent)
+                        originY = Me.CanvasY(parent)
+                    End If
+                End If
+                offsetX = Math.Round(Me.mContextX - originX) - bounds(0)
+                offsetY = Math.Round(Me.mContextY - originY) - bounds(1)
+            End If
+        Else
+            If snippet = Me.mLastPasted Then
+                Me.mPasteCount += 1
+            Else
+                Me.mLastPasted = snippet
+                Me.mPasteCount = 1
+            End If
+            offsetX = 10 * Me.mPasteCount
+            offsetY = 10 * Me.mPasteCount
+        End If
+        Try
+            Dim plan As LayoutPastePlan = Me.mDocument.PlanPaste(parentId, snippet, offsetX, offsetY)
+            Dim accepted As Boolean = Me.SubmitSelecting(Me.mDocument.Version, plan.Edits, plan.Names)
+            If accepted Then
+                Dim noun As String = " controls."
+                If Array.Count(plan.Names) = 1 Then noun = " control."
+                Me.Status("Pasted " + String.From(Array.Count(plan.Names)) + noun)
+            End If
+            Return accepted
+        Catch e As InvalidArgumentException
+            Me.Status(e.Message)
+            Return False
+        End Try
+    End Function
+
+    ''' Top-left of the snippet's top-level control frames, or [] when unknown.
+    Private Function SnippetOrigin(snippet As String) As Array Of Integer
+        Dim wrapped As New LayoutDocument("View BuoyClipboardBounds\n" + snippet + "End View\n")
+        Dim rootId As String = ""
+        Dim left As Integer = 16777216
+        Dim top As Integer = 16777216
+        For Each node As LayoutNode In wrapped.Nodes
+            If node.ParentId = "" Then
+                rootId = node.Id
+                Continue For
+            End If
+            If node.ParentId <> rootId Or Not node.HasLiteralFrame Then Continue For
+            left = Math.Min(left, node.X)
+            top = Math.Min(top, node.Y)
+        Next
+        If left = 16777216 Then Return []
+        Return [left, top]
+    End Function
+
+    Private Function DuplicateSelection() As Boolean
+        Dim ids As Array Of String = Me.ControlSelection()
+        If Array.Count(ids) = 0 Then Return False
+        Return Me.DuplicateAt(ids, 10, 10)
+    End Function
+
+    ''' Copies the controls and pastes them into the key control's container,
+    ''' offset by (dx, dy); used by Duplicate and Option-drag.
+    Private Function DuplicateAt(ids As Array Of String, dx As Integer, dy As Integer) As Boolean
+        If Not Me.CanEdit() Or Array.Count(ids) = 0 Then Return False
+        If Me.SharedParent(ids) = "" Then
+            Me.Status("Duplicate controls that share one container.")
+            Return False
+        End If
+        Try
+            Dim snippet As String = Me.mDocument.CopySnippet(ids)
+            Dim parentId As String = Me.mDocument.FindNode(ids(0)).ParentId
+            Dim plan As LayoutPastePlan = Me.mDocument.PlanPaste(parentId, snippet, dx, dy)
+            Return Me.SubmitSelecting(Me.mDocument.Version, plan.Edits, plan.Names)
+        Catch e As InvalidArgumentException
+            Me.Status(e.Message)
+            Return False
+        End Try
+    End Function
+
+    ' ------------------------------------------------------------ dispatcher
+
+    Public Function PerformCommand(command As String) As Boolean
+        Return Me.DispatchCommand(command, True)
+    End Function
+
+    Public Function CanPerformCommand(command As String) As Boolean
+        Return Me.DispatchCommand(command, False)
+    End Function
+
+    Public Function CommandChecked(command As String) As Boolean
+        Select Case command
+            Case "show-grid"
+                Return Me.mShowGrid
+            Case "snap-to-grid"
+                Return Me.mSnapToGrid
+            Case "smart-guides"
+                Return Me.mSmartGuides
+            Case "show-bounds"
+                Return Me.mShowBounds
+            Case "show-spacing"
+                Return Me.mShowSpacing
+            Case "align-to-selection"
+                Return Me.mAlignTarget = "selection"
+            Case "align-to-key"
+                Return Me.mAlignTarget = "key"
+            Case "align-to-parent"
+                Return Me.mAlignTarget = "parent"
+        End Select
+        Return False
+    End Function
+
+    ''' The alignment reference used by the align-* commands: selection, key or parent.
+    Public Property AlignTarget As String
+        Get
+            Return Me.mAlignTarget
+        End Get
+        Set
+            If value <> "selection" And value <> "key" And value <> "parent" Then Throw New InvalidArgumentException("Align target must be selection, key or parent")
+            Me.mAlignTarget = value
+            Me.NotifyCommandState()
+        End Set
+    End Property
+
+    Private Function DispatchCommand(command As String, perform As Boolean) As Boolean
+        If perform Then
+            Me.FinishInspectorEdit()
+            If Not String.StartsWith(command, "nudge-") Then Me.FlushNudge()
+        End If
+        Dim movableIds As Array Of String = Me.MovableSelection()
+        Dim movable As Integer = Array.Count(movableIds)
+        ' Same-container arrangement (align to selection/key, distribute, spacing).
+        Dim siblings As Boolean = movable > 0 And Me.SharedParent(movableIds) <> ""
+        Dim controls As Integer = Array.Count(Me.ControlSelection())
+        Dim editable As Boolean = Me.CanEdit()
+        Select Case command
+            ' Edit
+            Case "copy"
+                If controls = 0 Then Return False
+                If perform Then Return Me.CopySelection()
+                Return True
+            Case "cut"
+                If controls = 0 Or Not editable Or Not Me.RefactorAvailable Then Return False
+                If perform Then
+                    If Not Me.CopySelection() Then Return False
+                    Return Me.DeleteSelected()
+                End If
+                Return True
+            Case "paste"
+                If Not editable Then Return False
+                If Not perform Then Return Me.ClipboardMayHaveSnippet()
+                Dim snippet As String = Me.ReadClipboardSnippet()
+                If snippet = "" Then
+                    Me.Status("The clipboard holds no layout controls.")
+                    Return False
+                End If
+                Return Me.PasteSnippet(snippet, False)
+            Case "edit-primary"
+                If Me.CurrentNode() = Nil Then Return False
+                If perform Then
+                    Me.FlushNudge()
+                    Me.FocusPrimaryProperty()
+                End If
+                Return True
+            Case "rename"
+                If controls <> 1 Or Not editable Or Not Me.RefactorAvailable Then Return False
+                If perform Then
+                    If Not Me.InspectorPanelCommand("inspector-rename", True) Then
+                        Me.FocusPrimaryProperty()
+                        Me.Status("Rename the control from the inspector's Name field.")
+                    End If
+                End If
+                Return True
+            Case "duplicate"
+                If controls = 0 Or Not editable Then Return False
+                If Me.SharedParent(Me.ControlSelection()) = "" Then Return False
+                If perform Then Return Me.DuplicateSelection()
+                Return True
+            Case "delete"
+                If controls = 0 Or Not editable Or Not Me.RefactorAvailable Then Return False
+                If perform Then Return Me.DeleteSelected()
+                Return True
+            Case "select-all"
+                If Me.mDocument = Nil Or Me.mActiveRoot = "" Then Return False
+                If perform Then Return Me.SelectAllInContainer()
+                Return True
+            Case "deselect"
+                If Array.Count(Me.mSelection) = 0 Then Return False
+                If perform Then
+                    Me.mFocusContainer = ""
+                    Me.SelectNodes(Me.NoIds())
+                End If
+                Return True
+            Case "select-parent"
+                Dim current As LayoutNode = Me.CurrentNode()
+                If current = Nil Then Return False
+                If current.ParentId = "" Then Return False
+                If perform Then
+                    Me.mFocusContainer = ""
+                    Me.SelectNode(current.ParentId)
+                End If
+                Return True
+            ' Align
+            Case "align-left", "align-hcenter", "align-right", "align-top", "align-vcenter", "align-bottom"
+                If Not editable Then Return False
+                If movable < 2 And Not (movable >= 1 And Me.mAlignTarget = "parent") Then Return False
+                ' Selection and key references need one shared container.
+                If Me.mAlignTarget <> "parent" And Not siblings Then Return False
+                ' Aligning to the key needs the key itself to be an arrangeable control.
+                If Me.mAlignTarget = "key" And movableIds(0) <> Me.mSelected Then Return False
+                If perform Then Return Me.ModelCommand(command)
+                Return True
+            Case "align-to-selection", "align-to-key", "align-to-parent"
+                If perform Then Me.AlignTarget = String.Mid(command, 10)
+                Return True
+            Case "center-horizontally", "center-vertically"
+                If Not editable Or movable = 0 Then Return False
+                If perform Then Return Me.ModelCommand(command)
+                Return True
+            ' Distribute and spacing
+            Case "distribute-left", "distribute-hcenter", "distribute-right", "distribute-top", "distribute-vcenter", "distribute-bottom", "space-horizontal-equal", "space-vertical-equal"
+                If Not editable Or movable < 3 Or Not siblings Then Return False
+                If perform Then Return Me.ModelCommand(command)
+                Return True
+            Case "space-horizontal-increase", "space-horizontal-decrease", "space-horizontal-remove", "space-vertical-increase", "space-vertical-decrease", "space-vertical-remove"
+                If Not editable Or movable < 2 Or Not siblings Then Return False
+                If perform Then Return Me.ModelCommand(command)
+                Return True
+            ' Size
+            Case "size-same-width", "size-same-height", "size-same-size"
+                If Not editable Or movable < 2 Then Return False
+                If perform Then Return Me.ModelCommand(command)
+                Return True
+            Case "size-to-default"
+                If Not editable Or movable = 0 Then Return False
+                If perform Then Return Me.ModelCommand(command)
+                Return True
+            ' Order
+            Case "bring-to-front", "bring-forward", "send-backward", "send-to-back"
+                If Not editable Or controls <> 1 Then Return False
+                ' Nothing to do when the control is already at that end of its
+                ' siblings' declaration (z) order.
+                Dim position As Integer = Me.SiblingPosition(Me.ControlSelection()(0))
+                If position = 0 Or position = 3 Then Return False
+                If String.StartsWith(command, "bring-") And position = 2 Then Return False
+                If String.StartsWith(command, "send-") And position = 1 Then Return False
+                If perform Then Return Me.ModelCommand(command)
+                Return True
+            ' Containers
+            Case "embed-in-view"
+                If Not editable Or controls = 0 Then Return False
+                If Me.SharedParent(Me.ControlSelection()) = "" Then Return False
+                If perform Then Return Me.ModelCommand(command)
+                Return True
+            Case "unembed"
+                If Not editable Or controls <> 1 Then Return False
+                Dim view As LayoutNode = Me.CurrentNode()
+                If view = Nil Then Return False
+                If view.TypeName <> "View" Then Return False
+                If perform Then Return Me.ModelCommand(command)
+                Return True
+            ' Nudge
+            Case "nudge-left", "nudge-right", "nudge-up", "nudge-down", "nudge-left-large", "nudge-right-large", "nudge-up-large", "nudge-down-large"
+                Dim nudgeIds As Array Of String = Me.NudgeSelection()
+                If Not editable Or Array.Count(nudgeIds) = 0 Then Return False
+                If perform Then
+                    Me.FlushNudge()
+                    Dim amount As Integer = Me.NudgeStep(String.EndsWith(command, "-large"))
+                    Dim dx As Integer = 0
+                    Dim dy As Integer = 0
+                    If String.StartsWith(command, "nudge-left") Then dx = -amount
+                    If String.StartsWith(command, "nudge-right") Then dx = amount
+                    If String.StartsWith(command, "nudge-up") Then dy = -amount
+                    If String.StartsWith(command, "nudge-down") Then dy = amount
+                    ' The flush may have reloaded the document; re-read the selection.
+                    Return Me.CommitNudge(Me.NudgeSelection(), dx, dy)
+                End If
+                Return True
+            ' View
+            Case "zoom-in"
+                If Me.mZoom >= 16.0 Then Return False
+                If perform Then Me.ZoomTo(Me.ZoomStep(1))
+                Return True
+            Case "zoom-out"
+                If Me.mZoom <= 0.1 Then Return False
+                If perform Then Me.ZoomTo(Me.ZoomStep(-1))
+                Return True
+            Case "zoom-actual"
+                If perform Then Me.ZoomTo(1.0)
+                Return True
+            Case "zoom-fit"
+                If Me.mDocument = Nil Or Me.mActiveRoot = "" Then Return False
+                If perform Then
+                    Me.CancelGesture()
+                    Me.FitViewport()
+                    Me.NotifyCommandState()
+                End If
+                Return True
+            Case "show-grid"
+                If perform Then Me.ShowGrid = Not Me.mShowGrid
+                Return True
+            Case "snap-to-grid"
+                If perform Then Me.SnapToGrid = Not Me.mSnapToGrid
+                Return True
+            Case "smart-guides"
+                If perform Then Me.SmartGuides = Not Me.mSmartGuides
+                Return True
+            Case "show-bounds"
+                If perform Then Me.ShowBounds = Not Me.mShowBounds
+                Return True
+            Case "show-spacing"
+                If perform Then Me.ShowSpacing = Not Me.mShowSpacing
+                Return True
+        End Select
+        If Me.InspectorPanelCommand(command, perform) Then Return True
+        Return Me.PalettePanelCommand(command, perform)
+    End Function
+
+    ''' Where a control sits among its siblings in declaration (z) order:
+    ''' 0 not found, 1 back-most, 2 front-most, 3 only child, 4 in between.
+    Private Function SiblingPosition(id As String) As Integer
+        If Me.mDocument = Nil Then Return 0
+        Dim node As LayoutNode = Me.mDocument.FindNode(id)
+        If node = Nil Then Return 0
+        Dim index As Integer = -1
+        Dim count As Integer = 0
+        For Each candidate As LayoutNode In Me.mDocument.Nodes
+            If candidate.ParentId <> node.ParentId Then Continue For
+            If candidate.Id = node.Id Then index = count
+            count += 1
+        Next
+        If index < 0 Then Return 0
+        If count = 1 Then Return 3
+        If index = 0 Then Return 1
+        If index = count - 1 Then Return 2
+        Return 4
+    End Function
+
+    Private Function SelectAllInContainer() As Boolean
+        Dim parentId As String = Me.mActiveRoot
+        If Me.mFocusContainer <> "" Then
+            parentId = Me.mFocusContainer
+        Else
+            Dim current As LayoutNode = Me.CurrentNode()
+            If current <> Nil Then
+                If current.ParentId <> "" Then parentId = current.ParentId
+            End If
+        End If
+        Dim ids As Array Of String = []
+        For Each node As LayoutNode In Me.mDocument.Nodes
+            If node.ParentId = parentId And Me.IsCanvasNode(node) Then ids.Append(node.Id)
+        Next
+        Me.SelectNodes(ids)
+        Return Array.Count(ids) > 0
+    End Function
+
+    ''' Arrangement commands planned by the layout model; one transaction each.
+    Private Function ModelCommand(command As String) As Boolean
+        Me.CancelGesture()
+        If Not Me.CanEdit() Then Return False
+        Dim ids As Array Of String = Me.MovableSelection()
+        Dim spacingStep As Integer = 4
+        If Me.mSnapToGrid Then spacingStep = Me.EffectiveGrid()
+        Try
+            Select Case command
+                Case "align-left", "align-hcenter", "align-right", "align-top", "align-vcenter", "align-bottom"
+                    Return Me.CommitEdits(LayoutRelations.AlignToEdits(Me.mDocument, ids, String.Mid(command, 7), Me.mAlignTarget))
+                Case "center-horizontally"
+                    Return Me.CenterInParent(True)
+                Case "center-vertically"
+                    Return Me.CenterInParent(False)
+                Case "distribute-left", "distribute-hcenter", "distribute-right", "distribute-top", "distribute-vcenter", "distribute-bottom"
+                    Return Me.CommitEdits(LayoutRelations.DistributeEdgesEdits(Me.mDocument, ids, String.Mid(command, 12)))
+                Case "space-horizontal-equal"
+                    Return Me.CommitEdits(LayoutRelations.SpaceEdits(Me.mDocument, ids, "x", "equal", 0))
+                Case "space-vertical-equal"
+                    Return Me.CommitEdits(LayoutRelations.SpaceEdits(Me.mDocument, ids, "y", "equal", 0))
+                Case "space-horizontal-increase"
+                    Return Me.CommitEdits(LayoutRelations.SpaceEdits(Me.mDocument, ids, "x", "increase", spacingStep))
+                Case "space-horizontal-decrease"
+                    Return Me.CommitEdits(LayoutRelations.SpaceEdits(Me.mDocument, ids, "x", "decrease", spacingStep))
+                Case "space-horizontal-remove"
+                    Return Me.CommitEdits(LayoutRelations.SpaceEdits(Me.mDocument, ids, "x", "remove", 0))
+                Case "space-vertical-increase"
+                    Return Me.CommitEdits(LayoutRelations.SpaceEdits(Me.mDocument, ids, "y", "increase", spacingStep))
+                Case "space-vertical-decrease"
+                    Return Me.CommitEdits(LayoutRelations.SpaceEdits(Me.mDocument, ids, "y", "decrease", spacingStep))
+                Case "space-vertical-remove"
+                    Return Me.CommitEdits(LayoutRelations.SpaceEdits(Me.mDocument, ids, "y", "remove", 0))
+                Case "size-same-width"
+                    Return Me.CommitEdits(LayoutRelations.MatchSizeEdits(Me.mDocument, ids, "width"))
+                Case "size-same-height"
+                    Return Me.CommitEdits(LayoutRelations.MatchSizeEdits(Me.mDocument, ids, "height"))
+                Case "size-same-size"
+                    Return Me.CommitEdits(LayoutRelations.MatchSizeEdits(Me.mDocument, ids, "both"))
+                Case "size-to-default"
+                    Return Me.SizeToDefault()
+                Case "bring-to-front", "bring-forward", "send-backward", "send-to-back"
+                    Dim mode As String = "front"
+                    If command = "bring-forward" Then mode = "forward"
+                    If command = "send-backward" Then mode = "backward"
+                    If command = "send-to-back" Then mode = "back"
+                    Dim target As LayoutNode = Me.CurrentNode()
+                    If target = Nil Then Return False
+                    Return Me.SubmitSelecting(Me.mDocument.Version, Me.mDocument.ReorderEdits(target.Id, mode), [target.Name])
+                Case "embed-in-view"
+                    Dim plan As LayoutPastePlan = Me.mDocument.PlanEmbed(Me.ControlSelection(), "")
+                    Return Me.SubmitSelecting(Me.mDocument.Version, plan.Edits, plan.Names)
+                Case "unembed"
+                    Dim view As LayoutNode = Me.CurrentNode()
+                    If view = Nil Then Return False
+                    Dim plan As LayoutPastePlan = Me.mDocument.PlanUnembed(view.Id)
+                    Return Me.SubmitSelecting(Me.mDocument.Version, plan.Edits, plan.Names)
+            End Select
+        Catch e As InvalidArgumentException
+            Me.Status(e.Message)
+            Return False
+        End Try
+        Return False
+    End Function
+
+    ' ------------------------------------------------------- contextual menu
+
+    Private Function MenuCommand(parent As MenuItem, caption As String, command As String) As MenuItem
+        Dim item As New MenuItem()
+        item.Caption = caption
+        item.Tag = command
+        item.Enabled = Me.CanPerformCommand(command)
+        item.Checked = Me.CommandChecked(command)
+        parent.AddMenuItem(item)
+        Return item
+    End Function
+
+    ''' A submenu on macOS and Windows; on Linux (no native submenus) the items are
+    ''' added to the top level after a separator instead.
+    Private Function MenuGroup(base As MenuItem, caption As String) As MenuItem
+        #If TargetLinux Then
+        base.AddSeparator()
+        Return base
+        #Else
+        Dim group As New MenuItem()
+        group.Caption = caption
+        Return group
+        #End If
+    End Function
+
+    Private Sub CloseMenuGroup(base As MenuItem, group As MenuItem)
+        If group Is base Then Return
+        If group.Count() > 0 Then base.AddMenuItem(group)
+    End Sub
+
+    Private Function Flattened() As Boolean
+        #If TargetLinux Then
+        Return True
+        #Else
+        Return False
+        #End If
+    End Function
+
+    ''' Builds the surface's contextual menu for a surface-local point. Right-click
+    ''' on a control selects it first unless it is already selected.
+    Public Sub BuildContextMenu(base As MenuItem, screenX As Double, screenY As Double)
+        If Me.mDocument = Nil Or Me.mActiveRoot = "" Then Return
+        Me.FlushNudge()
+        Me.CancelGesture()
+        Me.mContextX = Me.DocX(screenX)
+        Me.mContextY = Me.DocY(screenY)
+        Dim hit As LayoutNode = Me.NodeAt(Me.mContextX, Me.mContextY)
+        If hit <> Nil Then
+            If Not Me.IsSelected(hit.Id) Then Me.SelectNode(hit.Id)
+        End If
+        Dim flat As Boolean = Me.Flattened()
+        If hit <> Nil And Array.Count(Me.ControlSelection()) > 0 Then
+            Dim current As LayoutNode = Me.CurrentNode()
+            Dim textual As Boolean = False
+            If current <> Nil Then textual = current.TypeName = "Button" Or current.TypeName = "Label" Or current.TypeName = "TextField" Or current.TypeName = "Checkbox" Or current.TypeName = "TextArea"
+            Dim editCaption As String = "Edit Primary Property…"
+            If textual Then editCaption = "Edit Caption/Text…"
+            Me.MenuCommand(base, editCaption, "edit-primary")
+            Me.MenuCommand(base, "Rename…", "rename")
+            Me.MenuCommand(base, "Properties", "inspector-properties")
+            base.AddSeparator()
+            Me.MenuCommand(base, "Cut", "cut")
+            Me.MenuCommand(base, "Copy", "copy")
+            Me.MenuCommand(base, "Paste", "paste")
+            Me.MenuCommand(base, "Duplicate", "duplicate")
+            Me.MenuCommand(base, "Delete", "delete")
+            Dim align As MenuItem = Me.MenuGroup(base, "Align")
+            Me.MenuCommand(align, "Align Left Edges", "align-left")
+            If Not flat Then Me.MenuCommand(align, "Align Horizontal Centres", "align-hcenter")
+            Me.MenuCommand(align, "Align Right Edges", "align-right")
+            Me.MenuCommand(align, "Align Top Edges", "align-top")
+            If Not flat Then Me.MenuCommand(align, "Align Vertical Centres", "align-vcenter")
+            Me.MenuCommand(align, "Align Bottom Edges", "align-bottom")
+            If Not flat Then
+                align.AddSeparator()
+                Me.MenuCommand(align, "Centre Horizontally in Container", "center-horizontally")
+                Me.MenuCommand(align, "Centre Vertically in Container", "center-vertically")
+                align.AddSeparator()
+                Me.MenuCommand(align, "Relative to Selection", "align-to-selection")
+                Me.MenuCommand(align, "Relative to Key Object", "align-to-key")
+                Me.MenuCommand(align, "Relative to Container", "align-to-parent")
+            End If
+            Me.CloseMenuGroup(base, align)
+            Dim distribute As MenuItem = Me.MenuGroup(base, "Distribute")
+            Me.MenuCommand(distribute, "Space Evenly Horizontally", "space-horizontal-equal")
+            Me.MenuCommand(distribute, "Space Evenly Vertically", "space-vertical-equal")
+            If Not flat Then
+                distribute.AddSeparator()
+                Me.MenuCommand(distribute, "Distribute Left Edges", "distribute-left")
+                Me.MenuCommand(distribute, "Distribute Horizontal Centres", "distribute-hcenter")
+                Me.MenuCommand(distribute, "Distribute Right Edges", "distribute-right")
+                Me.MenuCommand(distribute, "Distribute Top Edges", "distribute-top")
+                Me.MenuCommand(distribute, "Distribute Vertical Centres", "distribute-vcenter")
+                Me.MenuCommand(distribute, "Distribute Bottom Edges", "distribute-bottom")
+                distribute.AddSeparator()
+                Me.MenuCommand(distribute, "Increase Horizontal Spacing", "space-horizontal-increase")
+                Me.MenuCommand(distribute, "Decrease Horizontal Spacing", "space-horizontal-decrease")
+                Me.MenuCommand(distribute, "Remove Horizontal Spacing", "space-horizontal-remove")
+                Me.MenuCommand(distribute, "Increase Vertical Spacing", "space-vertical-increase")
+                Me.MenuCommand(distribute, "Decrease Vertical Spacing", "space-vertical-decrease")
+                Me.MenuCommand(distribute, "Remove Vertical Spacing", "space-vertical-remove")
+            End If
+            Me.CloseMenuGroup(base, distribute)
+            Dim size As MenuItem = Me.MenuGroup(base, "Size")
+            Me.MenuCommand(size, "Same Width", "size-same-width")
+            Me.MenuCommand(size, "Same Height", "size-same-height")
+            If Not flat Then Me.MenuCommand(size, "Same Size", "size-same-size")
+            Me.MenuCommand(size, "Size to Default", "size-to-default")
+            Me.CloseMenuGroup(base, size)
+            Dim order As MenuItem = Me.MenuGroup(base, "Order")
+            Me.MenuCommand(order, "Bring to Front", "bring-to-front")
+            If Not flat Then Me.MenuCommand(order, "Bring Forward", "bring-forward")
+            If Not flat Then Me.MenuCommand(order, "Send Backward", "send-backward")
+            Me.MenuCommand(order, "Send to Back", "send-to-back")
+            Me.CloseMenuGroup(base, order)
+            base.AddSeparator()
+            Me.MenuCommand(base, "Embed in View", "embed-in-view")
+            If Me.CanPerformCommand("unembed") Then Me.MenuCommand(base, "Unembed View", "unembed")
+            Me.MenuCommand(base, "Select Container", "select-parent")
+        Else
+            Me.MenuCommand(base, "Paste", "paste")
+            Me.MenuCommand(base, "Select All", "select-all")
+            base.AddSeparator()
+            Me.MenuCommand(base, "Zoom In", "zoom-in")
+            Me.MenuCommand(base, "Zoom Out", "zoom-out")
+            Me.MenuCommand(base, "Actual Size", "zoom-actual")
+            Me.MenuCommand(base, "Zoom to Fit", "zoom-fit")
+            base.AddSeparator()
+            Me.MenuCommand(base, "Show Grid", "show-grid")
+            Me.MenuCommand(base, "Snap to Grid", "snap-to-grid")
+            Me.MenuCommand(base, "Smart Guides", "smart-guides")
+            Me.MenuCommand(base, "Show Spacing", "show-spacing")
+            Me.MenuCommand(base, "Show Control Bounds", "show-bounds")
+            If Not flat And Me.CanEdit() Then
+                Dim insert As New MenuItem()
+                insert.Caption = "Insert Control"
+                For Each descriptor As LayoutControlDescriptor In Me.mCatalog.Controls()
+                    Dim item As New MenuItem()
+                    item.Caption = descriptor.DisplayName
+                    item.Tag = "insert:" + descriptor.TypeName
+                    insert.AddMenuItem(item)
+                Next
+                If insert.Count() > 0 Then
+                    base.AddSeparator()
+                    base.AddMenuItem(insert)
+                End If
+            End If
+        End If
+    End Sub
+
+    ''' Contextual-menu choice (the item Tag is a command name or insert:Type).
+    Public Sub ContextMenuChosen(tag As String)
+        Try
+            If String.StartsWith(tag, "insert:") Then
+                Dim typeName As String = String.Mid(tag, 8)
+                Me.InsertAtCanvasPoint(typeName, Me.SuggestName(typeName), Me.mContextX, Me.mContextY)
+                Return
+            End If
+            If tag = "paste" Then
+                ' Paste from the menu lands at the clicked location.
+                Dim snippet As String = Me.ReadClipboardSnippet()
+                If snippet = "" Then
+                    Me.Status("The clipboard holds no layout controls.")
+                    Return
+                End If
+                Me.PasteSnippet(snippet, True)
+                Return
+            End If
+            Me.PerformCommand(tag)
+        Catch e As InvalidArgumentException
+            Me.Status(e.Message)
+        End Try
+    End Sub
+End Class

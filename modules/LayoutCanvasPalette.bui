@@ -1,0 +1,1114 @@
+Import layoutcanvas.LayoutCanvasWheel
+Import editorkit
+Import layoutkit.LayoutDocument
+Import layoutkit.LayoutCatalog
+Import layoutkit.LayoutRefactor
+Import layoutkit.LayoutRelations
+
+' Tool palette: a dedicated column left of the canvas. A native search field sits
+' over a Canvas-drawn library (collapsible category sections, icon list or icon
+' grid, hover, description footer, drawn scrollbar, keyboard navigation).
+' Click arms placement, double-click/Return inserts, drag onto the canvas drops.
+
+Private Class LayoutPaletteSearchField Inherits TextField
+    Public Property Owner As LayoutEditor
+    Handle TextChanged()
+        If Me.Owner <> Nil Then Me.Owner.PaletteSearchChanged()
+    End Handle
+End Class
+
+Private Class LayoutPaletteCanvas Inherits LayoutWheelCanvas
+    Public Property Owner As LayoutEditor
+    Public Overrides Function NativeWheel(dx As Double, dy As Double, pixels As Boolean) As Boolean
+        If Me.Owner = Nil Then Return False
+        Return Me.Owner.PaletteWheel(dx, dy, pixels)
+    End Function
+    Handle Paint(g As Graphics)
+        If Me.Owner <> Nil Then Me.Owner.PaintPalette(g, Me.Width, Me.Height)
+    End Handle
+    Handle MouseDown(e As MouseEvent)
+        If Me.Owner = Nil Or e.Button <> MouseButton.Left Then Return
+        Me.Focus()
+        Me.Owner.PaletteMouseDown(e.X, e.Y, e.ClickCount)
+        e.Handled = True
+    End Handle
+    Handle MouseDrag(e As MouseEvent)
+        If Me.Owner <> Nil Then Me.Owner.PaletteMouseDrag(e.X, e.Y)
+    End Handle
+    Handle MouseUp(e As MouseEvent)
+        If Me.Owner = Nil Or e.Button <> MouseButton.Left Then Return
+        Me.Owner.PaletteMouseUp(e.X, e.Y)
+    End Handle
+    Handle MouseMove(e As MouseEvent)
+        If Me.Owner <> Nil Then Me.Owner.PaletteMouseMove(e.X, e.Y)
+    End Handle
+    Handle MouseExit(e As MouseEvent)
+        If Me.Owner <> Nil Then Me.Owner.PaletteMouseExit()
+    End Handle
+    Handle KeyDown(e As KeyEvent)
+        If Me.Owner = Nil Then Return
+        ' Leave shortcuts (Cmd/Ctrl/Alt chords) to menus instead of typing them.
+        If e.Modifiers.Primary Or e.Modifiers.Control Or e.Modifiers.Command Or e.Modifiers.Option Then Return
+        If Me.Owner.PaletteKeyDown(e.Key, e.Character) Then e.Handled = True
+    End Handle
+End Class
+
+' A laid-out palette entry in content coordinates (before scrolling).
+Private Class LayoutPaletteRow
+    Public Property Kind As String = "item"
+    Public Property Category As String = ""
+    Public Property Count As Integer = 0
+    Public Property Descriptor As LayoutControlDescriptor
+    Public Property X As Double = 0.0
+    Public Property Y As Double = 0.0
+    Public Property W As Double = 0.0
+    Public Property H As Double = 0.0
+End Class
+
+Public Partial Class LayoutEditor
+    Private Property mPalettePanel As View = New View()
+    Private Property mPaletteSearch As LayoutPaletteSearchField = New LayoutPaletteSearchField()
+    Private Property mPaletteList As LayoutPaletteCanvas = New LayoutPaletteCanvas()
+    Private Property mPaletteDescriptors As Array Of LayoutControlDescriptor = []
+    Private Property mPaletteRows As Array Of LayoutPaletteRow = []
+    Private Property mPaletteCollapsed As Array Of String = []
+    Private Property mPaletteFilterText As String = ""
+    Private Property mPaletteSelected As String = ""
+    Private Property mPaletteHover As Integer = -1
+    Private Property mPaletteHoverTool As String = ""
+    Private Property mPaletteGrid As Boolean = False
+    Private Property mPaletteShown As Boolean = True
+    Private Property mPaletteColumnWidth As Integer = 212
+    Private Property mPaletteScroll As Double = 0.0
+    Private Property mPaletteContentHeight As Double = 0.0
+    Private Property mPaletteWidthNow As Double = 212.0
+    Private Property mPaletteHeightNow As Double = 500.0
+    Private Property mPaletteDark As Boolean = False
+    Private Property mPalettePress As Integer = -1
+    Private Property mPalettePressX As Double = 0.0
+    Private Property mPalettePressY As Double = 0.0
+    Private Property mPaletteDragging As Boolean = False
+    Private Property mPaletteThumbDrag As Boolean = False
+    Private Property mPaletteThumbGrab As Double = 0.0
+
+    ' ---- Geometry (palette canvas coordinates) ----
+
+    Private Function PaletteListTop() As Double
+        Return 72.0
+    End Function
+
+    Private Function PaletteFooterHeight() As Double
+        If Me.mPaletteHeightNow < 220.0 Then Return 0.0
+        Return 66.0
+    End Function
+
+    Private Function PaletteListBottom() As Double
+        Return Math.Max(Me.PaletteListTop(), Me.mPaletteHeightNow - Me.PaletteFooterHeight())
+    End Function
+
+    Private Function PaletteViewport() As Double
+        Return Me.PaletteListBottom() - Me.PaletteListTop()
+    End Function
+
+    Public Property PaletteScrollOffset As Double
+        Get
+            Return Me.mPaletteScroll
+        End Get
+    End Property
+
+     ' Wheel/trackpad scrolling preserves selection and keyboard focus.
+    Public Function PaletteWheel(dx As Double, dy As Double, pixels As Boolean) As Boolean
+        If Not (dx >= -10000000.0 And dx <= 10000000.0 And dy >= -10000000.0 And dy <= 10000000.0) Then Return False
+        If Not Me.mPaletteShown Or Me.mPalettePress >= 0 Or Me.mPaletteDragging Or Me.mPaletteThumbDrag Then Return False
+        If dy = 0.0 Then Return False
+        Dim before As Double = Me.mPaletteScroll
+        Dim delta As Double = dy
+        If Not pixels Then delta *= 72.0
+        Me.mPaletteScroll += delta
+        Me.ClampPaletteScroll()
+        If Me.mPaletteScroll = before Then Return False
+        Me.mPaletteHover = -1
+        Me.mPaletteList.Invalidate()
+        Return True
+    End Function
+
+    Private Function PaletteMaxScroll() As Double
+        Return Math.Max(0.0, Me.mPaletteContentHeight - Me.PaletteViewport())
+    End Function
+
+    Private Sub ClampPaletteScroll()
+        If Me.mPaletteScroll > Me.PaletteMaxScroll() Then Me.mPaletteScroll = Me.PaletteMaxScroll()
+        If Me.mPaletteScroll < 0.0 Then Me.mPaletteScroll = 0.0
+    End Sub
+
+    Private Function PaletteGridColumns() As Integer
+        Return Math.Max(1, Math.Floor((Me.mPaletteWidthNow - 18.0) / 62.0))
+    End Function
+
+    ' ---- Catalog model ----
+
+    Private Function PaletteMatches(descriptor As LayoutControlDescriptor) As Boolean
+        Dim query As String = String.LCase(String.Trim(Me.mPaletteFilterText))
+        If query = "" Then Return True
+        Dim haystack As String = String.LCase(descriptor.DisplayName + " " + descriptor.TypeName + " " + descriptor.Category + " " + descriptor.PackageName + " " + descriptor.Description)
+        For Each token As String In String.Split(query, " ")
+            If token = "" Then Continue For
+            If Not String.Contains(haystack, token) Then Return False
+        Next
+        Return True
+    End Function
+
+    Private Function PaletteIsCollapsed(category As String) As Boolean
+        ' Filtering shows every match regardless of collapsed sections.
+        If String.Trim(Me.mPaletteFilterText) <> "" Then Return False
+        Return Array.Contains(Me.mPaletteCollapsed, String.LCase(category), True)
+    End Function
+
+    ''' Rebuilds section/item rows from the catalog snapshot, filter and view mode.
+    Private Sub LayoutPaletteRows()
+        Dim rows As Array Of LayoutPaletteRow = []
+        Dim y As Double = 4.0
+        Dim width As Double = Math.Max(40.0, Me.mPaletteWidthNow - 12.0)
+        Dim columns As Integer = Me.PaletteGridColumns()
+        Dim cell As Double = Math.Floor((width - 4.0) / columns)
+        For Each category As String In Me.mCatalog.Categories()
+            Dim members As Array Of LayoutControlDescriptor = []
+            For Each descriptor As LayoutControlDescriptor In Me.mPaletteDescriptors
+                If String.Compare(descriptor.Category, category, True) = 0 And Me.PaletteMatches(descriptor) Then members.Append(descriptor)
+            Next
+            If Array.Count(members) = 0 Then Continue For
+            Dim header As New LayoutPaletteRow()
+            header.Kind = "header"
+            header.Category = category
+            header.Count = Array.Count(members)
+            header.X = 0.0
+            header.Y = y
+            header.W = width
+            header.H = 26.0
+            rows.Append(header)
+            y += 26.0
+            If Me.PaletteIsCollapsed(category) Then
+                y += 2.0
+                Continue For
+            End If
+            Dim column As Integer = 0
+            For Each descriptor As LayoutControlDescriptor In members
+                Dim row As New LayoutPaletteRow()
+                row.Kind = "item"
+                row.Category = category
+                row.Descriptor = descriptor
+                If Me.mPaletteGrid Then
+                    row.X = 4.0 + column * cell
+                    row.Y = y
+                    row.W = cell
+                    row.H = 62.0
+                    column += 1
+                    If column >= columns Then
+                        column = 0
+                        y += 62.0
+                    End If
+                Else
+                    row.X = 0.0
+                    row.Y = y
+                    row.W = width
+                    row.H = 28.0
+                    y += 28.0
+                End If
+                rows.Append(row)
+            Next
+            If Me.mPaletteGrid And column > 0 Then y += 62.0
+            y += 6.0
+        Next
+        Me.mPaletteRows = rows
+        Me.mPaletteContentHeight = y + 4.0
+        Me.mPaletteHover = -1
+        Me.ClampPaletteScroll()
+    End Sub
+
+    Private Function PaletteItemIndex(typeName As String) As Integer
+        For i As Integer = 0 To Array.Count(Me.mPaletteRows) - 1
+            Dim row As LayoutPaletteRow = Me.mPaletteRows(i)
+            If row.Kind = "item" Then
+                If row.Descriptor.TypeName = typeName Then Return i
+            End If
+        Next
+        Return -1
+    End Function
+
+    Private Function PaletteDescriptor(typeName As String) As LayoutControlDescriptor
+        If typeName = "" Then Return Nil
+        For Each descriptor As LayoutControlDescriptor In Me.mPaletteDescriptors
+            If descriptor.TypeName = typeName Then Return descriptor
+        Next
+        Return Nil
+    End Function
+
+    Private Sub RefreshPalette()
+        Me.mPaletteDescriptors = Me.mCatalog.Controls()
+        If Me.PaletteDescriptor(Me.mPaletteSelected) = Nil Then
+            Me.mPaletteSelected = ""
+            If Array.Count(Me.mPaletteDescriptors) > 0 Then Me.mPaletteSelected = Me.mPaletteDescriptors(0).TypeName
+        End If
+        Me.LayoutPaletteRows()
+        Me.mPaletteList.Invalidate()
+    End Sub
+
+    ''' Hosts commonly register controls on the mutable Catalog after construction
+    ''' (RegisterBuiltinControls). Registration only appends, so a count change
+    ''' means the palette rows are stale.
+    Private Function SyncPaletteCatalog() As Boolean
+        If Array.Count(Me.mCatalog.Controls()) = Array.Count(Me.mPaletteDescriptors) Then Return False
+        Me.RefreshPalette()
+        Return True
+    End Function
+
+    ''' Repaints palette state (armed item, insert availability) after document,
+    ''' selection or placement changes.
+    Private Sub RefreshPaletteMode()
+        Me.SyncPaletteCatalog()
+        Me.mPaletteList.Invalidate()
+    End Sub
+
+    Private Sub ScrollPaletteToRow(index As Integer)
+        If index < 0 Or index >= Array.Count(Me.mPaletteRows) Then Return
+        Dim row As LayoutPaletteRow = Me.mPaletteRows(index)
+        Dim viewport As Double = Me.PaletteViewport()
+        If row.Y < Me.mPaletteScroll Then Me.mPaletteScroll = row.Y - 4.0
+        If row.Y + row.H > Me.mPaletteScroll + viewport Then Me.mPaletteScroll = row.Y + row.H - viewport + 4.0
+        Me.ClampPaletteScroll()
+    End Sub
+
+    Private Sub SetPaletteSelection(typeName As String)
+        Dim changed As Boolean = Me.mPaletteSelected <> typeName
+        Me.mPaletteSelected = typeName
+        Me.mPaletteList.AccessibleLabel = "Control library: " + typeName
+        If changed Then Me.mPaletteList.NotifyAccessibilityChanged()
+        Me.ScrollPaletteToRow(Me.PaletteItemIndex(typeName))
+        Me.mPaletteList.Invalidate()
+    End Sub
+
+    ' ---- Public palette API ----
+
+    ''' Select by canonical catalog identity, including package-qualified controls.
+    ''' Unknown identities leave the current palette and placement state untouched.
+    ''' A known identity cancels any stale placement, clears a filter that hides it
+    ''' and expands its section.
+    Public Function SelectPaletteType(typeName As String) As Boolean
+        Dim registered As Boolean = False
+        For Each descriptor As LayoutControlDescriptor In Me.mCatalog.Controls()
+            If descriptor.TypeName = typeName Then registered = True
+        Next
+        If Not registered Then Return False
+        ' Hosts may have registered controls through the mutable Catalog after
+        ' construction. Bring the palette up to date before selecting.
+        Me.RefreshPalette()
+        Dim descriptor As LayoutControlDescriptor = Me.PaletteDescriptor(typeName)
+        If descriptor = Nil Then Return False
+        Me.CancelGesture()
+        Me.DisarmPalette()
+        If Not Me.PaletteMatches(descriptor) Then Me.PaletteFilter = ""
+        Me.SetPaletteCategoryCollapsed(descriptor.Category, False)
+        Me.SetPaletteSelection(descriptor.TypeName)
+        Return True
+    End Function
+
+    ''' The keyboard/selection item: the target of PerformAction("insert"/"arm").
+    Public Function PaletteSelectedType() As String
+        Return Me.mPaletteSelected
+    End Function
+
+    ''' The palette item armed for click placement, or "" when nothing is armed.
+    Public Function PaletteArmedType() As String
+        ' Derived from the stage's placement state, so arming or disarming through
+        ' ArmPlacement, Escape or a placement click is always reflected.
+        If Not Me.PlacementArmed Then Return ""
+        Return Me.mArmedType
+    End Function
+
+    ''' Search text; matches display name, type, category, package and description.
+    Public Property PaletteFilter As String
+        Get
+            Return Me.mPaletteFilterText
+        End Get
+        Set
+            Me.mPaletteFilterText = value
+            If Me.mPaletteSearch.Text <> value Then Me.mPaletteSearch.Text = value
+            Me.mPaletteScroll = 0.0
+            Me.LayoutPaletteRows()
+            Dim visible As Array Of String = Me.PaletteVisibleTypes()
+            If Array.Count(visible) > 0 And Not Array.Contains(visible, Me.mPaletteSelected, True) Then Me.mPaletteSelected = visible(0)
+            Me.mPaletteList.Invalidate()
+        End Set
+    End Property
+
+    ''' Icon grid (True) or icon + name list (False).
+    Public Property PaletteGridMode As Boolean
+        Get
+            Return Me.mPaletteGrid
+        End Get
+        Set
+            Me.mPaletteGrid = value
+            Me.LayoutPaletteRows()
+            Me.ScrollPaletteToRow(Me.PaletteItemIndex(Me.mPaletteSelected))
+            Me.mPaletteList.Invalidate()
+        End Set
+    End Property
+
+    ''' Whether the palette column is shown; hiding gives its width to the canvas.
+    Public Property PaletteVisible As Boolean
+        Get
+            Return Me.mPaletteShown
+        End Get
+        Set
+            If Me.mPaletteShown = value Then Return
+            Me.mPaletteShown = value
+            Me.mPalettePanel.Visible = value
+            Me.RelayoutPanel()
+        End Set
+    End Property
+
+    ''' Item identities currently listed (filtered, collapsed sections omitted), in
+    ''' display order.
+    Public Function PaletteVisibleTypes() As Array Of String
+        Me.SyncPaletteCatalog()
+        Dim names As Array Of String = []
+        For Each row As LayoutPaletteRow In Me.mPaletteRows
+            If row.Kind = "item" Then names.Append(row.Descriptor.TypeName)
+        Next
+        Return names
+    End Function
+
+    ''' Section headers currently listed, in display order.
+    Public Function PaletteSections() As Array Of String
+        Me.SyncPaletteCatalog()
+        Dim names As Array Of String = []
+        For Each row As LayoutPaletteRow In Me.mPaletteRows
+            If row.Kind = "header" Then names.Append(row.Category)
+        Next
+        Return names
+    End Function
+
+    Public Function PaletteCategoryCollapsed(category As String) As Boolean
+        Return Array.Contains(Me.mPaletteCollapsed, String.LCase(category), True)
+    End Function
+
+    Public Sub SetPaletteCategoryCollapsed(category As String, collapsed As Boolean)
+        Dim key As String = String.LCase(category)
+        Dim kept As Array Of String = []
+        For Each existing As String In Me.mPaletteCollapsed
+            If existing <> key Then kept.Append(existing)
+        Next
+        If collapsed Then kept.Append(key)
+        Me.mPaletteCollapsed = kept
+        Me.LayoutPaletteRows()
+        Me.mPaletteList.Invalidate()
+    End Sub
+
+    ''' Scrolls a listed item into view and returns its frame in palette-canvas
+    ''' coordinates as {x, y, width, height}; an empty object when it is not listed
+    ''' (filtered out or in a collapsed section).
+    Public Function PaletteItemFrame(typeName As String) As JSONItem
+        Dim frame As JSONItem = JSONItem.NewObject()
+        Dim index As Integer = Me.PaletteItemIndex(typeName)
+        If index < 0 Then Return frame
+        Me.ScrollPaletteToRow(index)
+        Dim row As LayoutPaletteRow = Me.mPaletteRows(index)
+        frame.Value("x") = row.X + 6.0
+        frame.Value("y") = Me.PaletteListTop() + row.Y - Me.mPaletteScroll
+        frame.Value("width") = row.W - 8.0
+        frame.Value("height") = row.H
+        Return frame
+    End Function
+
+    ' ---- Actions ----
+
+    Private Function PaletteCanInsert() As Boolean
+        Return Me.mDocument <> Nil And Me.mHost <> Nil And Me.mActiveRoot <> ""
+    End Function
+
+    Private Sub DisarmPalette()
+        Me.DisarmPlacement()
+        Me.mPaletteList.Invalidate()
+    End Sub
+
+    ' Default insertion point: cascades so repeated inserts don't stack exactly.
+    Private Function PaletteInsertOffset(parentId As String) As Integer
+        Dim offset As Integer = 20
+        For attempt As Integer = 0 To 40
+            Dim occupied As Boolean = False
+            For Each node As LayoutNode In Me.mDocument.Nodes
+                If node.ParentId = parentId And node.X = offset And node.Y = offset Then
+                    occupied = True
+                    Exit For
+                End If
+            Next
+            If Not occupied Then Return offset
+            offset += 12
+        Next
+        Return offset
+    End Function
+
+    ' Insertion parent: the entered (focus) container, else the selected View, else
+    ' the selected control's View parent, else the active root. A View qualifies
+    ' only under the same rule as PasteContainer (a canvas-drawn, editable View with
+    ' a literal Frame), so controls never land inside a container the canvas does
+    ' not draw, such as a View inside a TabView.
+    Private Function PaletteInsertParent() As String
+        If Me.mFocusContainer <> "" Then
+            Dim focus As LayoutNode = Me.mDocument.FindNode(Me.mFocusContainer)
+            If Me.PaletteContainer(focus) Then Return focus.Id
+        End If
+        Dim selected As LayoutNode = Me.CurrentNode()
+        If selected <> Nil Then
+            If Me.PaletteContainer(selected) Then Return selected.Id
+            Dim parent As LayoutNode = Me.mDocument.FindNode(selected.ParentId)
+            If Me.PaletteContainer(parent) Then Return parent.Id
+        End If
+        Return Me.mActiveRoot
+    End Function
+
+    Private Function PaletteContainer(node As LayoutNode) As Boolean
+        If node = Nil Then Return False
+        If node.Id = Me.mActiveRoot Then Return True
+        Return node.TypeName = "View" And Me.CanMoveNode(node) And node.HasLiteralFrame
+    End Function
+
+    ''' Inserts the selected palette item at a default position inside the selected
+    ''' View, or the active root, with a suggested unique name.
+    Private Sub InsertFromPalette()
+        Dim descriptor As LayoutControlDescriptor = Me.PaletteDescriptor(Me.mPaletteSelected)
+        If descriptor = Nil Then
+            Me.Status("Choose a control in the palette.")
+            Return
+        End If
+        If Not Me.PaletteCanInsert() Then
+            Me.Status("Open a layout to insert " + descriptor.DisplayName + ".")
+            Return
+        End If
+        Me.DisarmPalette()
+        Dim parentId As String = Me.PaletteInsertParent()
+        Dim offset As Integer = Me.PaletteInsertOffset(parentId)
+        Me.InsertControl(parentId, descriptor.TypeName, Me.SuggestName(descriptor.TypeName), offset, offset, descriptor.DefaultWidth, descriptor.DefaultHeight)
+    End Sub
+
+    ''' Arms click placement of the selected palette item on the canvas.
+    Private Sub ArmFromPalette()
+        Dim descriptor As LayoutControlDescriptor = Me.PaletteDescriptor(Me.mPaletteSelected)
+        If descriptor = Nil Then
+            Me.Status("Choose a control in the palette.")
+            Return
+        End If
+        If Not Me.PaletteCanInsert() Then
+            Me.Status("Open a layout to place " + descriptor.DisplayName + ".")
+            Return
+        End If
+        Me.ArmPlacement(descriptor.TypeName, Me.SuggestName(descriptor.TypeName))
+        Me.Status("Click in the layout to place " + descriptor.DisplayName + " (Esc cancels).")
+        Me.mPaletteList.Invalidate()
+    End Sub
+
+    Private Sub TogglePaletteArm(typeName As String)
+        If Me.PaletteArmedType() = typeName Then
+            Me.DisarmPalette()
+            Me.Status("Placement cancelled.")
+            Return
+        End If
+        Me.SetPaletteSelection(typeName)
+        Me.ArmFromPalette()
+    End Sub
+
+    ' Drop at a palette-canvas point outside the column: converts to surface
+    ' coordinates and places through the same click-placement path as the stage.
+    Private Function DropPaletteItem(typeName As String, x As Double, y As Double) As Boolean
+        If Not Me.PaletteCanInsert() Then Return False
+        Dim editorX As Double = Me.mPalettePane.X + Me.mPalettePanel.X + Me.mPaletteList.X + x
+        Dim editorY As Double = Me.mPalettePane.Y + Me.mPalettePanel.Y + Me.mPaletteList.Y + y
+        Dim surfaceX As Double = editorX - Me.mStagePane.X - Me.mSurface.X
+        Dim surfaceY As Double = editorY - Me.mStagePane.Y - Me.mSurface.Y
+        If surfaceX < 0.0 Or surfaceY < 0.0 Or surfaceX > Me.mSurface.Width Or surfaceY > Me.mSurface.Height Then Return False
+        If Me.PaletteArmedType() <> typeName Then
+            Me.SetPaletteSelection(typeName)
+            Me.ArmFromPalette()
+        End If
+        If Not Me.PlacementArmed Then Return False
+        Me.BeginGesture(surfaceX, surfaceY)
+        Me.EndGesture()
+        If Me.PlacementArmed Then Me.DisarmPalette()
+        Me.mPaletteList.Invalidate()
+        Return True
+    End Function
+
+    ' ---- Commands ----
+
+    ''' Palette-owned commands routed from PerformCommand: "toggle-palette" shows or
+    ''' collapses the column; "palette-search" reveals it and focuses the search
+    ''' field. Returns whether the command is known and enabled; performs it only
+    ''' when perform is True.
+    Private Function PalettePanelCommand(command As String, perform As Boolean) As Boolean
+        Select Case command
+            Case "toggle-palette"
+                If perform Then Me.PaletteVisible = Not Me.mPaletteShown
+                Return True
+            Case "palette-search"
+                If perform Then
+                    Me.PaletteVisible = True
+                    Me.mPaletteSearch.SetFocus()
+                End If
+                Return True
+        End Select
+        Return False
+    End Function
+
+    ''' Shows the palette column (expanding it when collapsed) and focuses its list.
+    ''' The inspector's legacy "palette" mode delegates here.
+    Private Sub RevealPalette()
+        Me.PaletteVisible = True
+        Me.ScrollPaletteToRow(Me.PaletteItemIndex(Me.mPaletteSelected))
+        Me.mPaletteList.Invalidate()
+        Me.mPaletteList.Focus()
+    End Sub
+
+    ' ---- Event plumbing (public only so the private palette views can call it) ----
+
+    Public Sub PaletteSearchChanged()
+        Dim text As String = Me.mPaletteSearch.Text
+        If text <> Me.mPaletteFilterText Then Me.PaletteFilter = text
+    End Sub
+
+    Private Function PaletteRowAt(x As Double, y As Double) As Integer
+        If y < Me.PaletteListTop() Or y >= Me.PaletteListBottom() Then Return -1
+        Dim cy As Double = y - Me.PaletteListTop() + Me.mPaletteScroll
+        For i As Integer = 0 To Array.Count(Me.mPaletteRows) - 1
+            Dim row As LayoutPaletteRow = Me.mPaletteRows(i)
+            If cy >= row.Y And cy < row.Y + row.H And x >= row.X And x < row.X + row.W Then Return i
+        Next
+        Return -1
+    End Function
+
+    Private Function PaletteScrollable() As Boolean
+        Return Me.PaletteMaxScroll() > 0.0
+    End Function
+
+    Private Function PaletteThumbHeight() As Double
+        Dim viewport As Double = Me.PaletteViewport()
+        If Me.mPaletteContentHeight <= 0.0 Then Return viewport
+        Return Math.Max(28.0, viewport * viewport / Me.mPaletteContentHeight)
+    End Function
+
+    Private Function PaletteThumbTop() As Double
+        Dim travel As Double = Me.PaletteViewport() - Me.PaletteThumbHeight()
+        Dim maximum As Double = Me.PaletteMaxScroll()
+        If maximum <= 0.0 Then Return Me.PaletteListTop()
+        Return Me.PaletteListTop() + travel * Me.mPaletteScroll / maximum
+    End Function
+
+    ' Toolbar strip (between search field and list): view-mode toggles on the right.
+    Private Function PaletteToolAt(x As Double, y As Double) As String
+        If y < 46.0 Or y >= 70.0 Then Return ""
+        Dim w As Double = Me.mPaletteWidthNow
+        If x >= w - 56.0 And x < w - 34.0 Then Return "list"
+        If x >= w - 32.0 And x < w - 10.0 Then Return "grid"
+        Return ""
+    End Function
+
+    ''' Canvas-coordinate click. Returns True when the press hit an item.
+    Public Function PaletteMouseDown(x As Double, y As Double, clickCount As Integer) As Boolean
+        Me.mPaletteDragging = False
+        Me.mPaletteThumbDrag = False
+        Me.mPalettePress = -1
+        Dim tool As String = Me.PaletteToolAt(x, y)
+        If tool <> "" Then
+            Me.PaletteGridMode = tool = "grid"
+            Return False
+        End If
+        If Me.PaletteScrollable() And x >= Me.mPaletteWidthNow - 10.0 And y >= Me.PaletteListTop() And y < Me.PaletteListBottom() Then
+            Dim top As Double = Me.PaletteThumbTop()
+            If y >= top And y < top + Me.PaletteThumbHeight() Then
+                Me.mPaletteThumbDrag = True
+                Me.mPaletteThumbGrab = y - top
+            ElseIf y < top Then
+                Me.mPaletteScroll -= Me.PaletteViewport() - 28.0
+            Else
+                Me.mPaletteScroll += Me.PaletteViewport() - 28.0
+            End If
+            Me.ClampPaletteScroll()
+            Me.mPaletteList.Invalidate()
+            Return False
+        End If
+        Dim index As Integer = Me.PaletteRowAt(x, y)
+        If index < 0 Then Return False
+        Dim row As LayoutPaletteRow = Me.mPaletteRows(index)
+        If row.Kind = "header" Then
+            ' Filtering lists every match; collapsing then would be invisible.
+            If String.Trim(Me.mPaletteFilterText) = "" Then Me.SetPaletteCategoryCollapsed(row.Category, Not Me.PaletteCategoryCollapsed(row.Category))
+            Return False
+        End If
+        Me.mPaletteSelected = row.Descriptor.TypeName
+        If clickCount >= 2 Then
+            Me.InsertFromPalette()
+            Me.mPaletteList.Invalidate()
+            Return True
+        End If
+        Me.mPalettePress = index
+        Me.mPalettePressX = x
+        Me.mPalettePressY = y
+        Me.mPaletteList.Invalidate()
+        Return True
+    End Function
+
+    Public Sub PaletteMouseDrag(x As Double, y As Double)
+        If Me.mPaletteThumbDrag Then
+            Dim travel As Double = Me.PaletteViewport() - Me.PaletteThumbHeight()
+            If travel > 0.0 Then Me.mPaletteScroll = (y - Me.mPaletteThumbGrab - Me.PaletteListTop()) / travel * Me.PaletteMaxScroll()
+            Me.ClampPaletteScroll()
+            Me.mPaletteList.Invalidate()
+            Return
+        End If
+        If Me.mPalettePress < 0 Or Me.mPalettePress >= Array.Count(Me.mPaletteRows) Then Return
+        If Not Me.mPaletteDragging Then
+            If Math.Abs(x - Me.mPalettePressX) + Math.Abs(y - Me.mPalettePressY) < 5.0 Then Return
+            Me.mPaletteDragging = True
+        End If
+        Dim row As LayoutPaletteRow = Me.mPaletteRows(Me.mPalettePress)
+        If x >= Me.mPaletteWidthNow Then
+            Me.Status("Release over the layout to place " + row.Descriptor.DisplayName + ".")
+        Else
+            Me.Status("Drag " + row.Descriptor.DisplayName + " onto the layout.")
+        End If
+    End Sub
+
+    Public Sub PaletteMouseUp(x As Double, y As Double)
+        Dim pressed As Integer = Me.mPalettePress
+        Dim dragging As Boolean = Me.mPaletteDragging
+        Me.mPalettePress = -1
+        Me.mPaletteDragging = False
+        Me.mPaletteThumbDrag = False
+        If pressed < 0 Or pressed >= Array.Count(Me.mPaletteRows) Then Return
+        Dim row As LayoutPaletteRow = Me.mPaletteRows(pressed)
+        If row.Kind <> "item" Then Return
+        If dragging Then
+            If x >= Me.mPaletteWidthNow Or x < 0.0 Or y < 0.0 Or y > Me.mPaletteHeightNow Then
+                If Not Me.DropPaletteItem(row.Descriptor.TypeName, x, y) Then Me.Status("Drop inside the layout to place " + row.Descriptor.DisplayName + ".")
+            ElseIf Me.PaletteArmedType() = row.Descriptor.TypeName Then
+                ' Armed when the drag left the column; say so after it returns.
+                Me.Status("Click in the layout to place " + row.Descriptor.DisplayName + " (Esc cancels).")
+            End If
+            Return
+        End If
+        Me.TogglePaletteArm(row.Descriptor.TypeName)
+    End Sub
+
+    Public Sub PaletteMouseMove(x As Double, y As Double)
+        Dim index As Integer = Me.PaletteRowAt(x, y)
+        Dim tool As String = Me.PaletteToolAt(x, y)
+        If index = Me.mPaletteHover And tool = Me.mPaletteHoverTool Then Return
+        Me.mPaletteHover = index
+        Me.mPaletteHoverTool = tool
+        Me.mPaletteList.Invalidate()
+    End Sub
+
+    Public Sub PaletteMouseExit()
+        ' Without pointer capture a drag may stop reporting once it leaves the
+        ' column: arm the dragged item so a click on the canvas still places it.
+        If Me.mPaletteDragging And Me.mPalettePress >= 0 And Me.mPalettePress < Array.Count(Me.mPaletteRows) Then
+            Dim row As LayoutPaletteRow = Me.mPaletteRows(Me.mPalettePress)
+            If row.Kind = "item" And Me.PaletteArmedType() <> row.Descriptor.TypeName Then
+                Me.SetPaletteSelection(row.Descriptor.TypeName)
+                Me.ArmFromPalette()
+            End If
+        End If
+        Me.mPaletteHover = -1
+        Me.mPaletteHoverTool = ""
+        Me.mPaletteList.Invalidate()
+    End Sub
+
+    Private Sub MovePaletteSelection(delta As Integer)
+        Dim visible As Array Of String = Me.PaletteVisibleTypes()
+        If Array.Count(visible) = 0 Then Return
+        Dim index As Integer = Array.IndexOf(visible, Me.mPaletteSelected)
+        If index < 0 Then
+            index = 0
+        Else
+            index = Math.Max(0, Math.Min(Array.Count(visible) - 1, index + delta))
+        End If
+        Me.SetPaletteSelection(visible(index))
+    End Sub
+
+    ''' Keyboard navigation. Up/Down (and Left/Right in grid mode) move, PageUp/
+    ''' PageDown/Home/End jump, Left/Right collapse/expand the section in list mode,
+    ''' Return inserts, Space arms, Escape disarms then clears the filter, printable
+    ''' characters and Backspace edit the filter. Returns True when handled.
+    Public Function PaletteKeyDown(key As KeyName, character As Integer) As Boolean
+        Dim columns As Integer = 1
+        If Me.mPaletteGrid Then columns = Me.PaletteGridColumns()
+        Dim page As Integer = Math.Max(1, Math.Floor(Me.PaletteViewport() / 28.0) - 1)
+        If Me.mPaletteGrid Then page = Math.Max(1, Math.Floor(Me.PaletteViewport() / 62.0)) * columns
+        Select Case key
+            Case KeyName.Up
+                Me.MovePaletteSelection(-columns)
+            Case KeyName.Down
+                Me.MovePaletteSelection(columns)
+            Case KeyName.PageUp
+                Me.MovePaletteSelection(-page)
+            Case KeyName.PageDown
+                Me.MovePaletteSelection(page)
+            Case KeyName.Home
+                Me.MovePaletteSelection(-1000000)
+            Case KeyName.EndKey
+                Me.MovePaletteSelection(1000000)
+            Case KeyName.Left, KeyName.Right
+                If Me.mPaletteGrid Then
+                    If key = KeyName.Left Then
+                        Me.MovePaletteSelection(-1)
+                    Else
+                        Me.MovePaletteSelection(1)
+                    End If
+                Else
+                    Dim descriptor As LayoutControlDescriptor = Me.PaletteDescriptor(Me.mPaletteSelected)
+                    If descriptor = Nil Then Return False
+                    ' Sections cannot collapse while a filter shows every match.
+                    If String.Trim(Me.mPaletteFilterText) <> "" Then Return False
+                    Me.SetPaletteCategoryCollapsed(descriptor.Category, key = KeyName.Left)
+                    If key = KeyName.Left Then
+                        ' Move the selection to the nearest still-listed item so
+                        ' navigation and Return never act on a hidden control.
+                        Dim header As Integer = Me.PaletteHeaderIndex(descriptor.Category)
+                        Dim replacement As String = ""
+                        For i As Integer = header + 1 To Array.Count(Me.mPaletteRows) - 1
+                            If Me.mPaletteRows(i).Kind = "item" Then
+                                replacement = Me.mPaletteRows(i).Descriptor.TypeName
+                                Exit For
+                            End If
+                        Next
+                        If replacement = "" Then
+                            For i As Integer = header - 1 To 0 Step -1
+                                If Me.mPaletteRows(i).Kind = "item" Then
+                                    replacement = Me.mPaletteRows(i).Descriptor.TypeName
+                                    Exit For
+                                End If
+                            Next
+                        End If
+                        If replacement <> "" Then Me.mPaletteSelected = replacement
+                        Me.ScrollPaletteToRow(header)
+                    Else
+                        Me.ScrollPaletteToRow(Me.PaletteItemIndex(descriptor.TypeName))
+                    End If
+                End If
+            Case KeyName.Return
+                Me.InsertFromPalette()
+            Case KeyName.Space
+                If Me.mPaletteSelected = "" Then Return False
+                Me.TogglePaletteArm(Me.mPaletteSelected)
+            Case KeyName.Escape
+                If Me.PlacementArmed Then
+                    Me.DisarmPalette()
+                    Me.Status("Placement cancelled.")
+                ElseIf Me.mPaletteFilterText <> "" Then
+                    Me.PaletteFilter = ""
+                Else
+                    Return False
+                End If
+            Case KeyName.Backspace
+                If Me.mPaletteFilterText = "" Then Return False
+                Me.PaletteFilter = String.Left(Me.mPaletteFilterText, String.Len(Me.mPaletteFilterText) - 1)
+            Case Else
+                If character < 32 Or character = 127 Then Return False
+                Me.PaletteFilter = Me.mPaletteFilterText + String.Chr(character)
+        End Select
+        Me.mPaletteList.Invalidate()
+        Return True
+    End Function
+
+    Private Function PaletteHeaderIndex(category As String) As Integer
+        For i As Integer = 0 To Array.Count(Me.mPaletteRows) - 1
+            Dim row As LayoutPaletteRow = Me.mPaletteRows(i)
+            If row.Kind = "header" And String.Compare(row.Category, category, True) = 0 Then Return i
+        Next
+        Return -1
+    End Function
+
+    ' ---- Painting ----
+
+    Private Function PaletteColor(role As String) As Color
+        If Me.mPaletteDark Then
+            Select Case role
+                Case "background"
+                    Return Color.RGB(0.094, 0.110, 0.129)
+                Case "ink"
+                    Return Color.RGB(0.894, 0.910, 0.929)
+                Case "muted"
+                    Return Color.RGB(0.635, 0.675, 0.722)
+                Case "line"
+                    Return Color.RGB(0.173, 0.200, 0.235)
+                Case "hover"
+                    Return Color.RGBA(1.0, 1.0, 1.0, 0.06)
+                Case "selected"
+                    Return Color.RGBA(0.373, 0.816, 0.725, 0.12)
+                Case "armed"
+                    Return Color.RGBA(0.373, 0.816, 0.725, 0.22)
+                Case "thumb"
+                    Return Color.RGBA(1.0, 1.0, 1.0, 0.22)
+            End Select
+            Return Color.RGB(0.373, 0.816, 0.725)
+        End If
+        Select Case role
+            Case "background"
+                Return Color.RGB(0.976, 0.980, 0.984)
+            Case "ink"
+                Return Color.RGB(0.106, 0.129, 0.161)
+            Case "muted"
+                Return Color.RGB(0.357, 0.396, 0.451)
+            Case "line"
+                Return Color.RGB(0.882, 0.898, 0.918)
+            Case "hover"
+                Return Color.RGBA(0.106, 0.129, 0.161, 0.05)
+            Case "selected"
+                Return Color.RGBA(0.059, 0.463, 0.431, 0.09)
+            Case "armed"
+                Return Color.RGBA(0.059, 0.463, 0.431, 0.17)
+            Case "thumb"
+                Return Color.RGBA(0.106, 0.129, 0.161, 0.25)
+        End Select
+        Return Color.RGB(0.059, 0.463, 0.431)
+    End Function
+
+    Private Function PaletteFit(g As IGraphics, text As String, maxWidth As Double, size As Double) As String
+        If maxWidth <= 0.0 Then Return ""
+        If g.MeasureStringWidth(text, "", size) <= maxWidth Then Return text
+        Dim cut As String = text
+        While String.Len(cut) > 1 And g.MeasureStringWidth(cut + "…", "", size) > maxWidth
+            cut = String.Left(cut, String.Len(cut) - 1)
+        End While
+        Return cut + "…"
+    End Function
+
+    Private Sub PaintPaletteTools(g As IGraphics, w As Double)
+        Dim muted As Color = Me.PaletteColor("muted")
+        Dim accent As Color = Me.PaletteColor("accent")
+        Dim visible As Integer = Array.Count(Me.PaletteVisibleTypes())
+        Dim summary As String = String.From(Array.Count(Me.mPaletteDescriptors)) + " controls"
+        If String.Trim(Me.mPaletteFilterText) <> "" Then summary = String.From(visible) + " of " + String.From(Array.Count(Me.mPaletteDescriptors))
+        If Not Me.PaletteCanInsert() Then summary = "Open a layout to place controls"
+        g.DrawString(Me.PaletteFit(g, summary, w - 80.0, 11.0), 12.0, 62.0, "", 11.0, muted)
+        For Each tool As String In ["list", "grid"]
+            Dim left As Double = w - 56.0
+            If tool = "grid" Then left = w - 32.0
+            Dim active As Boolean = (tool = "grid") = Me.mPaletteGrid
+            Dim tint As Color = muted
+            If active Then
+                g.FillRoundedRect(left, 48.0, 22.0, 20.0, 5.0, Me.PaletteColor("selected"))
+                tint = accent
+            ElseIf Me.mPaletteHoverTool = tool Then
+                g.FillRoundedRect(left, 48.0, 22.0, 20.0, 5.0, Me.PaletteColor("hover"))
+            End If
+            If tool = "list" Then
+                For i As Integer = 0 To 2
+                    g.BeginPath()
+                    g.FillOval(left + 5.0, 52.5 + i * 4.5, 2.5, 2.5, tint)
+                    g.FillRect(left + 9.5, 53.0 + i * 4.5, 8.0, 1.5, tint)
+                Next
+            Else
+                For i As Integer = 0 To 3
+                    g.FillRoundedRect(left + 5.5 + (i Mod 2) * 6.0, 52.0 + (i \ 2) * 6.0, 4.5, 4.5, 1.0, tint)
+                Next
+            End If
+        Next
+        g.DrawLine(0.0, 70.5, w, 70.5, 1.0, Me.PaletteColor("line"))
+    End Sub
+
+    Private Sub PaintPaletteRow(g As IGraphics, row As LayoutPaletteRow, index As Integer, top As Double, w As Double, focused As Boolean)
+        Dim ink As Color = Me.PaletteColor("ink")
+        Dim muted As Color = Me.PaletteColor("muted")
+        Dim accent As Color = Me.PaletteColor("accent")
+        Dim y As Double = top + row.Y - Me.mPaletteScroll
+        If row.Kind = "header" Then
+            If index = Me.mPaletteHover Then g.FillRoundedRect(4.0, y + 2.0, row.W - 4.0, row.H - 4.0, 5.0, Me.PaletteColor("hover"))
+            Dim cx As Double = 12.0
+            Dim cy As Double = y + row.H / 2.0
+            g.BeginPath()
+            If Me.PaletteIsCollapsed(row.Category) Then
+                g.MoveTo(cx + 1.0, cy - 4.0)
+                g.LineTo(cx + 6.0, cy)
+                g.LineTo(cx + 1.0, cy + 4.0)
+            Else
+                g.MoveTo(cx - 0.5, cy - 2.5)
+                g.LineTo(cx + 7.5, cy - 2.5)
+                g.LineTo(cx + 3.5, cy + 2.5)
+            End If
+            g.ClosePath()
+            g.FillPath(muted)
+            Dim count As String = String.From(row.Count)
+            Dim countWidth As Double = g.MeasureStringWidth(count, "", 10.5)
+            g.DrawString(Me.PaletteFit(g, String.UCase(row.Category), row.W - countWidth - 40.0, 10.5), 26.0, cy + 4.0, "", 10.5, muted)
+            g.DrawString(count, row.W - countWidth - 8.0, cy + 4.0, "", 10.5, muted)
+            Return
+        End If
+        Dim descriptor As LayoutControlDescriptor = row.Descriptor
+        Dim armed As Boolean = Me.PaletteArmedType() = descriptor.TypeName
+        Dim selected As Boolean = descriptor.TypeName = Me.mPaletteSelected
+        Dim left As Double = row.X + 6.0
+        Dim width As Double = row.W - 8.0
+        If Me.mPaletteGrid Then
+            left = row.X + 2.0
+            width = row.W - 4.0
+        End If
+        Dim box As Double = row.H - 2.0
+        If armed Then
+            g.FillRoundedRect(left, y + 1.0, width, box, 6.0, Me.PaletteColor("armed"))
+        ElseIf selected Then
+            g.FillRoundedRect(left, y + 1.0, width, box, 6.0, Me.PaletteColor("selected"))
+        ElseIf index = Me.mPaletteHover Then
+            g.FillRoundedRect(left, y + 1.0, width, box, 6.0, Me.PaletteColor("hover"))
+        End If
+        If selected And focused Then g.StrokeRoundedRect(left + 0.5, y + 1.5, width - 1.0, box - 1.0, 6.0, 1.0, accent)
+        Dim icon As LayoutIconPainter = Me.mCatalog.IconFor(descriptor.TypeName)
+        Dim nameColor As Color = ink
+        If armed Then nameColor = accent
+        If Me.mPaletteGrid Then
+            Try
+                icon.PaintIcon(g, row.X + (row.W - 24.0) / 2.0, y + 9.0, 24.0, Me.mPaletteDark)
+            Catch e As Exception
+            End Try
+            Dim label As String = Me.PaletteFit(g, descriptor.DisplayName, row.W - 8.0, 10.5)
+            Dim labelWidth As Double = g.MeasureStringWidth(label, "", 10.5)
+            g.DrawString(label, row.X + (row.W - labelWidth) / 2.0, y + 50.0, "", 10.5, nameColor)
+        Else
+            If armed Then g.FillRoundedRect(left, y + 6.0, 3.0, box - 10.0, 1.5, accent)
+            Try
+                icon.PaintIcon(g, left + 8.0, y + 4.0, 20.0, Me.mPaletteDark)
+            Catch e As Exception
+            End Try
+            g.DrawString(Me.PaletteFit(g, descriptor.DisplayName, width - 44.0, 12.5), left + 36.0, y + 18.5, "", 12.5, nameColor)
+        End If
+    End Sub
+
+    Private Sub PaintPaletteFooter(g As IGraphics, w As Double, h As Double)
+        Dim footer As Double = Me.PaletteFooterHeight()
+        If footer <= 0.0 Then Return
+        Dim top As Double = h - footer
+        g.DrawLine(0.0, top + 0.5, w, top + 0.5, 1.0, Me.PaletteColor("line"))
+        Dim descriptor As LayoutControlDescriptor
+        If Me.mPaletteHover >= 0 And Me.mPaletteHover < Array.Count(Me.mPaletteRows) Then
+            Dim hovered As LayoutPaletteRow = Me.mPaletteRows(Me.mPaletteHover)
+            If hovered.Kind = "item" Then descriptor = hovered.Descriptor
+        End If
+        If descriptor = Nil Then descriptor = Me.PaletteDescriptor(Me.mPaletteSelected)
+        If descriptor = Nil Then
+            g.DrawString("No control selected", 12.0, top + 30.0, "", 11.5, Me.PaletteColor("muted"))
+            Return
+        End If
+        Try
+            Me.mCatalog.IconFor(descriptor.TypeName).PaintIcon(g, 12.0, top + 14.0, 28.0, Me.mPaletteDark)
+        Catch e As Exception
+        End Try
+        Dim title As String = descriptor.DisplayName + "  " + String.From(descriptor.DefaultWidth) + " × " + String.From(descriptor.DefaultHeight)
+        Dim origin As String = "builtin"
+        If descriptor.PackageName <> "builtin" Then
+            origin = descriptor.PackageName
+            Dim sourceImport As String = descriptor.Metadata.Value("sourceImport").AsString().Or("")
+            If sourceImport <> "" Then origin = sourceImport
+        End If
+        g.DrawString(Me.PaletteFit(g, title, w - 60.0, 12.0), 50.0, top + 23.0, "", 12.0, Me.PaletteColor("ink"))
+        Dim detail As String = descriptor.Description
+        If Me.PaletteArmedType() = descriptor.TypeName Then
+            detail = "Click in the layout to place · Esc cancels"
+        ElseIf Not Me.PaletteCanInsert() Then
+            detail = "Open a layout to place controls"
+        ElseIf detail = "" Then
+            detail = "Click to place, double-click to insert"
+        End If
+        detail = origin + " · " + detail
+        ' Word-wrap the detail onto at most two lines.
+        Dim limit As Double = w - 60.0
+        Dim first As String = ""
+        Dim words As Array Of String = String.Split(detail, " ")
+        Dim used As Integer = 0
+        For Each word As String In words
+            Dim candidate As String = word
+            If first <> "" Then candidate = first + " " + word
+            If first <> "" And g.MeasureStringWidth(candidate, "", 11.0) > limit Then Exit For
+            first = candidate
+            used += 1
+        Next
+        Dim rest As String = ""
+        For i As Integer = used To Array.Count(words) - 1
+            If rest <> "" Then rest = rest + " "
+            rest = rest + words(i)
+        Next
+        g.DrawString(Me.PaletteFit(g, first, limit, 11.0), 50.0, top + 40.0, "", 11.0, Me.PaletteColor("muted"))
+        If rest <> "" Then g.DrawString(Me.PaletteFit(g, rest, limit, 11.0), 50.0, top + 54.0, "", 11.0, Me.PaletteColor("muted"))
+    End Sub
+
+    Public Sub PaintPalette(g As Graphics, width As Double, height As Double)
+        Me.SyncPaletteCatalog()
+        Me.mPaletteDark = Me.ChromeDark
+        Dim w As Double = Math.Max(1.0, width)
+        Dim h As Double = Math.Max(1.0, height)
+        If w <> Me.mPaletteWidthNow Or h <> Me.mPaletteHeightNow Then
+            Me.mPaletteWidthNow = w
+            Me.mPaletteHeightNow = h
+            Me.LayoutPaletteRows()
+        End If
+        g.FillRect(0.0, 0.0, w, h, Me.PaletteColor("background"))
+        g.DrawLine(w - 0.5, 0.0, w - 0.5, h, 1.0, Me.PaletteColor("line"))
+        Me.PaintPaletteTools(g, w)
+        Dim top As Double = Me.PaletteListTop()
+        Dim bottom As Double = Me.PaletteListBottom()
+        Dim focused As Boolean = Me.mPaletteList.HasFocus()
+        g.Save()
+        Try
+            g.ClipToRect(0.0, top, w, Math.Max(0.0, bottom - top))
+            If Array.Count(Me.mPaletteRows) = 0 Then
+                Dim message As String = "No controls registered"
+                If String.Trim(Me.mPaletteFilterText) <> "" Then message = "No controls match \"" + String.Trim(Me.mPaletteFilterText) + "\""
+                message = Me.PaletteFit(g, message, w - 24.0, 11.5)
+                g.DrawString(message, (w - g.MeasureStringWidth(message, "", 11.5)) / 2.0, top + 36.0, "", 11.5, Me.PaletteColor("muted"))
+            End If
+            For i As Integer = 0 To Array.Count(Me.mPaletteRows) - 1
+                Dim row As LayoutPaletteRow = Me.mPaletteRows(i)
+                Dim y As Double = top + row.Y - Me.mPaletteScroll
+                If y + row.H < top Or y > bottom Then Continue For
+                Me.PaintPaletteRow(g, row, i, top, w, focused)
+            Next
+            If Me.PaletteScrollable() Then g.FillRoundedRect(w - 8.0, Me.PaletteThumbTop() + 2.0, 4.0, Me.PaletteThumbHeight() - 4.0, 2.0, Me.PaletteColor("thumb"))
+        Finally
+            g.Restore()
+        End Try
+        Me.PaintPaletteFooter(g, w, h)
+    End Sub
+
+    ' ---- Construction and layout ----
+
+    Private Sub BuildPalette()
+        Me.mPaletteList.Owner = Me
+        Me.mPaletteList.Focusable = True
+        Me.mPaletteList.AccessibleRole = AccessibleRole.List
+        Me.mPaletteList.AccessibleLabel = "Control library"
+        Me.mPaletteList.AccessibleHint = "Arrow keys choose a control. Space places, Return inserts, and Escape cancels."
+        Me.mPaletteSearch.Owner = Me
+        Me.mPaletteSearch.Placeholder = "Search controls"
+        Me.mPalettePanel.AddSubview(Me.mPaletteList)
+        Me.mPalettePanel.AddSubview(Me.mPaletteSearch)
+        Me.mPalettePane.AddSubview(Me.mPalettePanel)
+    End Sub
+
+    ''' Width of the dedicated palette column left of the canvas (0 when hidden).
+    Private Function PalettePanelWidth() As Integer
+        If Not Me.mPaletteShown Then Return 0
+        ' Narrow editors keep at least ~360pt for the canvas and inspector.
+        Return Math.Max(0, Math.Min(Me.mPaletteColumnWidth, Me.mPanelWidth - 360))
+    End Function
+
+    Private Sub LayoutPaletteArea(x As Integer, y As Integer, width As Integer, height As Integer)
+        Dim w As Integer = Math.Max(1, width)
+        Dim h As Integer = Math.Max(1, height)
+        Me.mPalettePanel.Visible = Me.mPaletteShown And width > 0
+        Me.mPalettePanel.Move(x, y, w, h)
+        Me.mPaletteList.Move(0, 0, w, h)
+        Me.mPaletteSearch.Move(10, 10, Math.Max(1, w - 20), 28)
+        Me.mPaletteWidthNow = w
+        Me.mPaletteHeightNow = h
+        Me.LayoutPaletteRows()
+        Me.mPaletteList.Invalidate()
+    End Sub
+End Class

@@ -1,0 +1,781 @@
+Import editorkit
+Import layoutkit.LayoutDocument
+Import layoutkit.LayoutCatalog
+Import layoutkit.LayoutRefactor
+Import layoutkit.LayoutRelations
+Import layoutcanvas.LayoutCanvasStage
+Import layoutcanvas.LayoutCanvasInspector
+Import layoutcanvas.LayoutCanvasPalette
+Import layoutcanvas.LayoutCanvasCommands
+Import layoutcanvas.LayoutCanvasWheel
+
+' Native chrome (inspector, palette fields) follows the application's EFFECTIVE
+' appearance. On macOS a host may override NSApp.appearance per process, which
+' System.IsDarkMode (the system preference) does not reflect.
+#If TargetMac Then
+    Private Declare Function ChromeClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+    Private Declare Function ChromeApplication Lib "AppKit" Selector "sharedApplication" (cls As Ptr) As Ptr
+    Private Declare Function ChromeEffectiveAppearance Lib "AppKit" Selector "effectiveAppearance" (application As Ptr) As Ptr
+    Private Declare Function ChromeAppearanceName Lib "AppKit" Selector "name" (appearance As Ptr) As CFStringRef
+#End If
+
+Private Function LayoutChromeSystemDark() As Boolean
+    #If TargetMac Then
+        Dim application As Ptr = ChromeApplication(ChromeClass("NSApplication"))
+        If application <> Nil Then
+            Dim appearance As Ptr = ChromeEffectiveAppearance(application)
+            If appearance <> Nil Then
+                Dim nativeName As CFStringRef = ChromeAppearanceName(appearance)
+                If nativeName <> Nil Then Return String.Contains(CType(nativeName, String), "Dark", True)
+            End If
+        End If
+    #End If
+    Dim gtkTheme As String = String.LCase(System.EnvironmentVariable("GTK_THEME").Or(""))
+    If String.EndsWith(gtkTheme, ":dark") Or String.EndsWith(gtkTheme, "-dark") Then Return True
+    Return System.IsDarkMode
+End Function
+
+''' The application owns the authoritative document, transactions and undo history.
+Public Interface LayoutEditorHost
+    Function CommitLayoutEdits(expectedVersion As Integer, edits As Array Of EditorEdit) As Boolean
+    Sub LayoutSelectionChanged(nodeId As String)
+    Sub LayoutStatus(message As String)
+End Interface
+
+''' Optional: a host that also implements this is told whenever selection, document,
+''' viewport or toggle state changes so it can refresh menus and toolbars.
+Public Interface LayoutEditorCommandObserver
+    Sub LayoutCommandStateChanged()
+End Interface
+
+Private Class LayoutPanelSplitter Inherits Splitter
+    Public Property Owner As Weak LayoutEditor
+    Public Sub Constructor()
+        Super.Constructor(Orientation.Vertical)
+    End Sub
+    Public Overrides Sub NotifyPaneResized(paneIndex As Integer)
+        Super.NotifyPaneResized(paneIndex)
+        Dim editor As LayoutEditor = Me.Owner
+        If editor <> Nil Then editor.LayoutSplitContents()
+    End Sub
+    Handle DividerMoved(dividerIndex As Integer, position As Double)
+        Dim editor As LayoutEditor = Me.Owner
+        If editor <> Nil Then editor.RememberPanelWidths()
+    End Handle
+End Class
+
+''' Native composite; draws representations only and never instantiates source controls.
+''' The class is split into Partial fragments: this core (document, selection, host
+''' and model commands), LayoutCanvasStage, LayoutCanvasInspector and LayoutCanvasPalette.
+Public Partial Class LayoutEditor Inherits View
+    Private Property mHost As LayoutEditorHost
+    Private Property mDocument As LayoutDocument
+    Private Property mActiveRoot As String
+    Private Property mRoots As Array Of String = []
+    Private Property mSelected As String
+    ' Ordered selection; mSelection(0) is the key object and always equals mSelected.
+    Private Property mSelection As Array Of String = []
+    ' Control names to select after the host reloads (paste, duplicate, embed).
+    Private Property mPendingNames As Array Of String = []
+    Private Property mCatalog As LayoutCatalog
+    Private Property mGeneration As Integer = 0
+    Private Property mPanelWidth As Integer = 800
+    Private Property mPanelHeight As Integer = 500
+    Private Property mChromeAppearance As String = "auto"
+    Private Property mPanelSplit As LayoutPanelSplitter = New LayoutPanelSplitter()
+    Private Property mPalettePane As View
+    Private Property mStagePane As View
+    Private Property mInspectorPane As View
+    Private Property mLayingOutPanels As Boolean = False
+
+    ''' Native divider controls around the design surface. Sidebar widths survive relayout.
+    Public Property PanelSplitter As Splitter
+        Get
+            Return Me.mPanelSplit
+        End Get
+    End Property
+
+    Public Property PaletteWidth As Integer
+        Get
+            Return Me.mPaletteColumnWidth
+        End Get
+        Set
+            Me.mPaletteColumnWidth = Math.Max(120, Math.Min(360, value))
+            Me.RelayoutPanel()
+        End Set
+    End Property
+
+    ''' Appearance of the inspector and palette panels: "auto" (default) follows the
+    ''' application's effective appearance so painted panels always match their native
+    ''' child controls; "light"/"dark" force it. Independent of CanvasAppearance, which
+    ''' only previews the designed layout.
+    Public Property ChromeAppearance As String
+        Get
+            Return Me.mChromeAppearance
+        End Get
+        Set
+            If value <> "auto" And value <> "light" And value <> "dark" Then Throw New InvalidArgumentException("Chrome appearance must be auto, light or dark")
+            Me.mChromeAppearance = value
+            Me.RelayoutPanel()
+        End Set
+    End Property
+
+    Public Property ChromeDark As Boolean
+        Get
+            If Me.mChromeAppearance <> "auto" Then Return Me.mChromeAppearance = "dark"
+            Return LayoutChromeSystemDark()
+        End Get
+    End Property
+
+    Public Sub Constructor()
+        Super.Constructor()
+        Me.mCatalog = New LayoutCatalog()
+        ' Native splitters negotiate arranged frames while panes are added.
+        ' Give them real bounds before creating dividers, even before mounting.
+        Me.mPanelSplit.Move(0, 0, Me.mPanelWidth, Me.mPanelHeight)
+        ' Hairline dividers, matching the Studio shell. GTK paints a grab strip as a solid
+        ' band and its thin handle already accepts nearby presses, so Linux adds none.
+        Me.mPanelSplit.DividerStyle = DividerStyle.Thin
+        #If Not TargetLinux Then
+            Me.mPanelSplit.DividerHitWidth = 6.0
+        #End If
+        Me.mPanelSplit.AllowsUserCollapse = False
+        Me.mPalettePane = Me.mPanelSplit.AddPane(120.0)
+        Me.mStagePane = Me.mPanelSplit.AddPane(80.0)
+        Me.mInspectorPane = Me.mPanelSplit.AddPane(220.0)
+        Me.mPanelSplit.Pane(0).MaxSize = 360.0
+        Me.mPanelSplit.Pane(2).MaxSize = 560.0
+        Me.mPanelSplit.Pane(0).HoldsSize = True
+        Me.mPanelSplit.Pane(2).HoldsSize = True
+        Me.AddSubview(Me.mPanelSplit)
+        Me.mPanelSplit.Owner = Me
+        Me.BuildStage()
+        Me.BuildInspector()
+        Me.BuildPalette()
+        Me.LayoutPanel(800, 500)
+        Me.RefreshPalette()
+        Me.RefreshInspector()
+    End Sub
+
+    ''' Columns: optional palette | native divider | canvas | native divider | inspector.
+    Public Sub LayoutPanel(width As Integer, height As Integer)
+        If Me.mLayingOutPanels Then Return
+        Me.mPanelWidth = Math.Max(1, width)
+        Me.mPanelHeight = Math.Max(1, height)
+        Me.mLayingOutPanels = True
+        Try
+            ' Visibility is controlled by the palette and inspector commands; the center stays open.
+            Me.mPanelSplit.AllowsUserCollapse = True
+            Dim paletteWidth As Integer = Me.PalettePanelWidth()
+            ' The grab strip overlaps adjacent panes; only the visible bar uses space.
+            Dim gap As Integer = Math.Ceiling(Me.mPanelSplit.DividerThickness)
+            Dim inspectorWidth As Integer = Math.Min(Me.InspectorPanelWidth(), Math.Max(1, Me.mPanelWidth - paletteWidth - 80 - gap * 2))
+            Me.mPanelSplit.Pane(0).MinSize = Math.Max(1, Math.Min(120, paletteWidth))
+            Me.mPanelSplit.Pane(2).MinSize = Math.Max(1, Math.Min(220, inspectorWidth))
+            If Me.mPanelSplit.Width <> Me.mPanelWidth Or Me.mPanelSplit.Height <> Me.mPanelHeight Then Me.mPanelSplit.Move(0, 0, Me.mPanelWidth, Me.mPanelHeight)
+            Me.mPanelSplit.Pane(0).Collapsed = paletteWidth = 0
+            Me.mPanelSplit.Pane(1).Collapsed = False
+            Me.mPanelSplit.Pane(2).Collapsed = Me.mInspectorCollapsed
+            If paletteWidth > 0 Then Me.mPanelSplit.SetDividerPosition(0, paletteWidth)
+            If Not Me.mInspectorCollapsed Then
+                Dim inspectorPosition As Double = Me.mPanelWidth - inspectorWidth - gap
+                #If TargetMac Or TargetLinux Then
+                    ' Both runtimes interpret the second position relative to the preceding pane.
+                    inspectorPosition -= Me.mPanelSplit.Pane(0).Size + gap
+                #End If
+                Me.mPanelSplit.SetDividerPosition(1, inspectorPosition)
+            End If
+        Finally
+            Me.mPanelSplit.AllowsUserCollapse = False
+            Me.mLayingOutPanels = False
+        End Try
+        Me.LayoutSplitContents()
+    End Sub
+
+    ''' Native pane resize callbacks lay out children in their own pane coordinates.
+    Public Sub LayoutSplitContents()
+        If Me.mLayingOutPanels Or Me.mInspectorPane = Nil Then Return
+        Me.mLayingOutPanels = True
+        Try
+            Dim paletteWidth As Integer = Me.SplitPaneWidth(0, Me.mPalettePane)
+            Dim stageWidth As Integer = Me.SplitPaneWidth(1, Me.mStagePane)
+            Dim inspectorWidth As Integer = Me.SplitPaneWidth(2, Me.mInspectorPane)
+            Me.LayoutPaletteArea(0, 0, paletteWidth, Me.mPanelHeight)
+            Me.LayoutStageArea(0, 0, stageWidth, Me.mPanelHeight)
+            Me.LayoutInspectorArea(0, 0, inspectorWidth, Me.mPanelHeight)
+        Finally
+            Me.mLayingOutPanels = False
+        End Try
+    End Sub
+
+    Private Function SplitPaneWidth(index As Integer, pane As View) As Integer
+        If Me.mPanelSplit.Pane(index).Collapsed Then Return 0
+        Dim size As Integer = Math.Max(0, Math.Floor(Me.mPanelSplit.Pane(index).Size))
+        If pane.Width > 0 Then size = Math.Min(size, pane.Width)
+        Return size
+    End Function
+
+    ''' Store only user divider changes, so a narrow window does not erase preferences.
+    Public Sub RememberPanelWidths()
+        If Me.mLayingOutPanels Then Return
+        If Not Me.mPanelSplit.Pane(0).Collapsed Then Me.mPaletteColumnWidth = Math.Max(120, Math.Min(360, Math.Round(Me.mPanelSplit.Pane(0).Size)))
+        If Not Me.mPanelSplit.Pane(2).Collapsed Then Me.mInspectorWidth = Math.Max(220, Math.Min(560, Math.Round(Me.mPanelSplit.Pane(2).Size)))
+        Me.LayoutSplitContents()
+    End Sub
+
+    ''' Re-applies the last LayoutPanel size after a fragment changes its column width.
+    Public Sub RelayoutPanel()
+        Me.LayoutPanel(Me.mPanelWidth, Me.mPanelHeight)
+    End Sub
+
+    Public Property Catalog As LayoutCatalog
+        Get
+            Return Me.mCatalog
+        End Get
+        Set
+            If value = Nil Then Throw New InvalidArgumentException("Catalog cannot be Nil")
+            Me.CancelGesture()
+            Me.ExpireBindings()
+            Me.mCatalog = value
+            Me.RefreshPalette()
+            Me.RefreshInspector()
+            Me.mSurface.Invalidate()
+        End Set
+    End Property
+
+    Public Property ActiveRootId As String
+        Get
+            Return Me.mActiveRoot
+        End Get
+    End Property
+
+    Public Sub SelectRootIndex(index As Integer)
+        If index >= 0 And index < Array.Count(Me.mRoots) Then Me.SelectRoot(Me.mRoots(index))
+    End Sub
+
+    Public Function SelectRoot(id As String) As Boolean
+        If Me.mDocument = Nil Then Return False
+        id = Me.FlushNudgeKeeping(id)
+        Dim root As LayoutNode = Me.mDocument.FindNode(id)
+        If root = Nil Then Return False
+        If root.ParentId <> "" Then Return False
+        Me.CancelGesture()
+        Me.ExpireBindings()
+        Me.mActiveRoot = id
+        Me.mSelected = ""
+        Me.mSelection = []
+        For i As Integer = 0 To Array.Count(Me.mRoots) - 1
+            If Me.mRoots(i) = id Then Me.mRootPicker.SelectedIndex = i
+        Next
+        Me.RefreshInspector()
+        Me.ViewportRootChanged()
+        Me.mSurface.Invalidate()
+        If Me.mHost <> Nil Then Me.mHost.LayoutSelectionChanged("")
+        Me.NotifyCommandState()
+        Return True
+    End Function
+
+    Public Property SelectedId As String
+        Get
+            Return Me.mSelected
+        End Get
+    End Property
+
+    Public Sub AttachHost(host As LayoutEditorHost)
+        Me.CancelGesture()
+        Me.DiscardNudge()
+        Me.ExpireBindings()
+        Me.mHost = host
+        Me.RefreshInspector()
+    End Sub
+
+    Public Sub DetachHost()
+        Me.CloseInput()
+        Me.CancelGesture()
+        Me.DiscardNudge()
+        Me.ExpireBindings()
+        Me.mHost = Nil
+        Me.RefreshInspector()
+    End Sub
+
+    Public Sub LoadDocument(document As LayoutDocument)
+        ' Drop a live marquee silently: CancelGesture would otherwise publish its
+        ' picks against the outgoing document and notify the host mid-reload. The
+        ' live picks are in mSelection and are remapped below like any selection,
+        ' then reported once the new document is installed.
+        Dim wasMarquee As Boolean = Me.mMarquee
+        Me.mMarquee = False
+        Me.CancelGesture()
+        Me.DiscardNudge()
+        Me.ExpireBindings()
+        Dim rootName As String
+        Dim rootType As String
+        Dim oldIds As Array Of String = []
+        Dim oldNames As Array Of String = []
+        Dim oldTypes As Array Of String = []
+        If Me.mDocument <> Nil Then
+            Dim oldRoot As LayoutNode = Me.mDocument.FindNode(Me.mActiveRoot)
+            If oldRoot <> Nil Then
+                rootName = oldRoot.Name
+                rootType = oldRoot.TypeName
+            End If
+            For Each previousId As String In Me.mSelection
+                Dim previous As LayoutNode = Me.mDocument.FindNode(previousId)
+                If previous = Nil Then Continue For
+                oldIds.Append(previousId)
+                oldNames.Append(previous.Name)
+                oldTypes.Append(previous.TypeName)
+            Next
+        End If
+        Dim oldAllNames As Array Of String = []
+        Dim focusName As String = ""
+        If Me.mDocument <> Nil Then
+            For Each existing As LayoutNode In Me.mDocument.Nodes
+                oldAllNames.Append(existing.Name)
+            Next
+            Dim focus As LayoutNode = Me.mDocument.FindNode(Me.mFocusContainer)
+            If focus <> Nil Then focusName = focus.Name
+        End If
+        Dim previousRootKey As String = rootName + ":" + rootType
+        Dim activeRootKey As String = ""
+        Me.mDocument = Nil
+        If document <> Nil Then Me.mDocument = New LayoutDocument(document.SourceText, document.Version)
+        Me.mActiveRoot = ""
+        Me.mRoots = []
+        Me.mRootPicker.RemoveAllItems()
+        If Me.mDocument <> Nil Then
+            For Each root As LayoutNode In Me.mDocument.Nodes
+                If root.ParentId <> "" Then Continue For
+                Me.mRoots.Append(root.Id)
+                Me.mRootPicker.AddItem(root.Name + " : " + root.TypeName)
+                If Me.mActiveRoot = "" Or (root.Name = rootName And root.TypeName = rootType) Then
+                    Me.mActiveRoot = root.Id
+                    activeRootKey = root.Name + ":" + root.TypeName
+                End If
+            Next
+        End If
+        For i As Integer = 0 To Array.Count(Me.mRoots) - 1
+            If Me.mRoots(i) = Me.mActiveRoot Then Me.mRootPicker.SelectedIndex = i
+        Next
+        Dim oldId As String = Me.mSelected
+        ' Node identities are source offsets, so the selection follows control
+        ' names, falling back to an unchanged identity of the same type (renames).
+        Dim remapped As Array Of String = []
+        If Array.Count(Me.mPendingNames) > 0 Then
+            For Each pendingName As String In Me.mPendingNames
+                Dim pending As LayoutNode = Me.FindNodeNamed(pendingName)
+                If pending <> Nil Then remapped.Append(pending.Id)
+            Next
+            Me.mPendingNames = []
+        End If
+        ' Without resolvable pending names (no paste/insert, or a host that
+        ' rejected the commit but reloaded anyway) the previous selection follows.
+        If Array.Count(remapped) = 0 And Me.mDocument <> Nil Then
+            For i As Integer = 0 To Array.Count(oldIds) - 1
+                Dim found As LayoutNode = Me.FindNodeNamed(oldNames(i))
+                If found = Nil Then
+                    found = Me.mDocument.FindNode(oldIds(i))
+                    ' Only a rename keeps the identity: the node there must carry a
+                    ' name the previous document did not have.
+                    If found <> Nil Then
+                        If found.TypeName <> oldTypes(i) Or Array.IndexOf(oldAllNames, found.Name, True) >= 0 Then found = Nil
+                    End If
+                End If
+                If found <> Nil Then remapped.Append(found.Id)
+            Next
+        End If
+        Me.ApplySelection(remapped)
+        Me.mFocusContainer = ""
+        Dim focusNode As LayoutNode = Me.FindNodeNamed(focusName)
+        If focusNode <> Nil Then Me.mFocusContainer = focusNode.Id
+        If previousRootKey <> activeRootKey Then Me.ViewportRootChanged()
+        Me.RefreshInspector()
+        Me.mSurface.Invalidate()
+        If (oldId <> Me.mSelected Or wasMarquee) And Me.mHost <> Nil Then Me.mHost.LayoutSelectionChanged(Me.mSelected)
+        Me.NotifyCommandState()
+    End Sub
+
+    Public Sub SelectNode(id As String)
+        If id = "" Then
+            Me.SelectNodes(Me.NoIds())
+        Else
+            Me.SelectNodes([id])
+        End If
+    End Sub
+
+    ''' Replaces the selection. The first valid id becomes the key (primary) object.
+    ''' Unknown ids, ids outside the active root, duplicates and descendants of
+    ''' other selected nodes are dropped.
+    Public Sub SelectNodes(ids As Array Of String)
+        Dim current As Array Of String = Me.FlushNudgeKeepingAll(ids)
+        Me.CancelGesture()
+        Me.ExpireBindings()
+        Me.ApplySelection(current)
+        Me.RefreshInspector()
+        Me.mSurface.Invalidate()
+        If Me.mHost <> Nil Then Me.mHost.LayoutSelectionChanged(Me.mSelected)
+        Me.NotifyCommandState()
+    End Sub
+
+    ''' Primary (key) object first.
+    Public Function SelectedIds() As Array Of String
+        Dim copied As Array Of String = []
+        For Each id As String In Me.mSelection
+            copied.Append(id)
+        Next
+        Return copied
+    End Function
+
+    Private Sub ApplySelection(ids As Array Of String)
+        Dim valid As Array Of String = []
+        If Me.mDocument <> Nil Then
+            For Each id As String In ids
+                If id = "" Or Array.Contains(valid, id) Then Continue For
+                Dim node As LayoutNode = Me.mDocument.FindNode(id)
+                If node = Nil Then Continue For
+                If Me.InActiveRoot(node) Then valid.Append(node.Id)
+            Next
+        End If
+        Dim kept As Array Of String = []
+        For Each id As String In valid
+            Dim covered As Boolean = False
+            Dim parent As LayoutNode = Me.mDocument.FindNode(Me.mDocument.FindNode(id).ParentId)
+            While parent <> Nil
+                If Array.Contains(valid, parent.Id) Then
+                    covered = True
+                    Exit While
+                End If
+                parent = Me.mDocument.FindNode(parent.ParentId)
+            End While
+            If Not covered Then kept.Append(id)
+        Next
+        Me.mSelection = kept
+        Me.mSelected = ""
+        If Array.Count(kept) > 0 Then Me.mSelected = kept(0)
+    End Sub
+
+    ''' Commits a pending keyboard nudge and returns the id of the same node
+    ''' (looked up by name) in the reloaded document.
+    Private Function FlushNudgeKeeping(id As String) As String
+        Dim mapped As Array Of String = Me.FlushNudgeKeepingAll([id])
+        Return mapped(0)
+    End Function
+
+    ' Capture every identity against the same snapshot before one flush can
+    ' change any subsequent byte-offset ids. Constraint ids share this rule.
+    Private Function FlushNudgeKeepingAll(ids As Array Of String) As Array Of String
+        If Array.Count(Me.mNudgeIds) = 0 Or Me.mDocument = Nil Then Return ids
+        Dim before As LayoutDocument = Me.mDocument
+        Dim records As Array Of LayoutNode = []
+        Dim constraintIndexes As Array Of Integer = []
+        Dim constraints As JSONItem = Me.Constraints()
+        For Each id As String In ids
+            records.Append(before.FindNode(id))
+            Dim index As Integer = -1
+            For i As Integer = 0 To constraints.Count() - 1
+                If constraints.ValueAt(i).Value("id").AsString().Or("") = id Then index = i
+            Next
+            constraintIndexes.Append(index)
+        Next
+        Me.FlushNudge()
+        If Me.mDocument = before Or Me.mDocument = Nil Then Return ids
+        Dim currentConstraints As JSONItem = Me.Constraints()
+        Dim mapped As Array Of String = []
+        For i As Integer = 0 To Array.Count(ids) - 1
+            Dim id As String = ids(i)
+            Dim node As LayoutNode = records(i)
+            If node <> Nil Then
+                ' Root-local names are unique; never resolve into another root.
+                Dim oldRoot As LayoutNode = node
+                While oldRoot.ParentId <> ""
+                    oldRoot = before.FindNode(oldRoot.ParentId)
+                End While
+                id = ""
+                For Each candidate As LayoutNode In Me.mDocument.Nodes
+                    If candidate.Name <> node.Name Or candidate.TypeName <> node.TypeName Then Continue For
+                    Dim root As LayoutNode = candidate
+                    While root.ParentId <> ""
+                        root = Me.mDocument.FindNode(root.ParentId)
+                    End While
+                    If root.Name = oldRoot.Name And root.TypeName = oldRoot.TypeName Then
+                        id = candidate.Id
+                        Exit For
+                    End If
+                Next
+            ElseIf constraintIndexes(i) >= 0 Then
+                id = ""
+                If constraintIndexes(i) < currentConstraints.Count() Then id = currentConstraints.ValueAt(constraintIndexes(i)).Value("id").AsString().Or("")
+            End If
+            mapped.Append(id)
+        Next
+        Return mapped
+    End Function
+
+    Private Function NoIds() As Array Of String
+        Dim empty As Array Of String = []
+        Return empty
+    End Function
+
+    Private Function IsSelected(id As String) As Boolean
+        Return Array.Contains(Me.mSelection, id)
+    End Function
+
+    Private Function FindNodeNamed(name As String) As LayoutNode
+        If Me.mDocument = Nil Or name = "" Then Return Nil
+        For Each node As LayoutNode In Me.mDocument.Nodes
+            If node.Name <> name Or node.ParentId = "" Then Continue For
+            If Me.InActiveRoot(node) Then Return node
+        Next
+        Return Nil
+    End Function
+
+    Private Sub NotifyCommandState()
+        Dim observer As LayoutEditorCommandObserver = TryCast(Me.mHost, LayoutEditorCommandObserver)
+        If observer <> Nil Then observer.LayoutCommandStateChanged()
+    End Sub
+
+    Private Function CurrentNode() As LayoutNode
+        If Me.mDocument = Nil Or Me.mSelected = "" Then Return Nil
+        Dim node As LayoutNode = Me.mDocument.FindNode(Me.mSelected)
+        If node = Nil Then Return Nil
+        If Not Me.InActiveRoot(node) Then Return Nil
+        Return node
+    End Function
+
+    Private Sub Status(message As String)
+        If Me.mHost <> Nil Then Me.mHost.LayoutStatus(message)
+    End Sub
+
+    Private Function Submit(version As Integer, edits As Array Of EditorEdit) As Boolean
+        If Me.mHost = Nil Or Array.Count(edits) = 0 Then Return False
+        Dim accepted As Boolean = Me.mHost.CommitLayoutEdits(version, edits)
+        If Not accepted Then Me.Status("Layout edit rejected; reload the current document and try again.")
+        Return accepted
+    End Function
+
+    Private Function InActiveRoot(node As LayoutNode) As Boolean
+        Dim current As LayoutNode = node
+        While current.ParentId <> ""
+            current = Me.mDocument.FindNode(current.ParentId)
+            If current = Nil Then Return False
+        End While
+        Return current.Id = Me.mActiveRoot
+    End Function
+
+    Private Function ResolveDescriptor(typeName As String) As LayoutControlDescriptor
+        If Me.mDocument <> Nil Then
+            Dim found As LayoutControlDescriptor = Me.mCatalog.FindSource(typeName, Me.mDocument.SourceImports())
+            If found <> Nil Then Return found
+        End If
+        Return Me.mCatalog.Find(typeName)
+    End Function
+
+    Public Function InsertControl(parentId As String, typeName As String, controlName As String, x As Integer, y As Integer, width As Integer, height As Integer) As Boolean
+        parentId = Me.FlushNudgeKeeping(parentId)
+        Me.CancelGesture()
+        If Me.mDocument = Nil Or Me.mHost = Nil Or Me.mActiveRoot = "" Then Return False
+        Dim parent As LayoutNode = Me.mDocument.FindNode(parentId)
+        If parent = Nil Then Return False
+        If Not Me.InActiveRoot(parent) Then
+            Me.Status("Choose an insertion parent in the active layout.")
+            Return False
+        End If
+        Dim descriptor As LayoutControlDescriptor = Me.mCatalog.Find(typeName)
+        If descriptor = Nil Then
+            Me.Status("Unknown control type: " + typeName)
+            Return False
+        End If
+        Dim sourceType As String = descriptor.Metadata.Value("sourceTypeName").AsString().Or(descriptor.TypeName)
+        If String.Contains(sourceType, ".") Then
+            Me.Status("Qualified type requires a source import.")
+            Return False
+        End If
+        Dim importName As String = descriptor.Metadata.Value("sourceImport").AsString().Or("")
+        Dim sourceImports As Array Of String = Me.mDocument.SourceImports()
+        If importName <> "" Then sourceImports.Append(importName)
+        If Me.mCatalog.FindSource(sourceType, sourceImports) <> descriptor Then
+            Me.Status("The source type is ambiguous with another imported control.")
+            Return False
+        End If
+        Dim props As JSONItem = Me.DefaultProperties(descriptor)
+        Dim floatingProperties As Array Of String = []
+        For Each propertyDescriptor As LayoutPropertyDescriptor In descriptor.Properties
+            If String.LCase(propertyDescriptor.Kind) = "double" Then floatingProperties.Append(propertyDescriptor.Name)
+        Next
+        Try
+            Dim edits As Array Of EditorEdit = Me.mDocument.InsertControlEdits(parentId, sourceType, controlName, x, y, width, height, props, importName, floatingProperties)
+            ' The inserted control is selected after the host reloads.
+            Return Me.SubmitSelecting(Me.mDocument.Version, edits, [controlName])
+        Catch e As InvalidArgumentException
+            Me.Status(e.Message)
+            Return False
+        End Try
+    End Function
+
+    Private Function DefaultProperties(descriptor As LayoutControlDescriptor) As JSONItem
+        Dim props As JSONItem = JSONItem.NewObject()
+        For Each prop As LayoutPropertyDescriptor In descriptor.Properties
+            If prop.ConstructorIndex >= 0 Or prop.ConstructorParameter <> "" Then Continue For
+            If prop.ReadOnly Then Continue For
+            Dim raw As String = String.Trim(prop.DefaultExpression)
+            If raw = "" Then Continue For
+            If raw = "True" Then
+                props.Value(prop.Name) = True
+            ElseIf raw = "False" Then
+                props.Value(prop.Name) = False
+            Else
+                Dim parsed As Optional Of JSONItem = Json.TryParse(raw)
+                If parsed.HasValue Then
+                    If parsed.Value.IsString() Or parsed.Value.IsNumber() Then props.Value(prop.Name) = parsed.Value
+                End If
+            End If
+        Next
+        Return props
+    End Function
+
+    Public Function RenameSelected(newName As String) As Boolean
+        Me.FlushNudge()
+        Me.CancelGesture()
+        Dim node As LayoutNode = Me.CurrentNode()
+        If node = Nil Or Me.mDocument = Nil Then
+            Me.Status("No control selected.")
+            Return False
+        End If
+        Dim refactorHost As LayoutProjectRefactorHost = TryCast(Me.mHost, LayoutProjectRefactorHost)
+        If refactorHost = Nil Then
+            Me.Status("Project-safe rename requires a refactor host.")
+            Return False
+        End If
+        Return refactorHost.RenameLayoutControl(Me.mDocument.Version, node.Id, newName)
+    End Function
+
+    ''' Deletes every selected control through the project refactor host, one
+    ''' project-safe transaction per control (re-found by name after each reload).
+    Public Function DeleteSelected() As Boolean
+        Me.FlushNudge()
+        Me.CancelGesture()
+        Dim node As LayoutNode = Me.CurrentNode()
+        If node = Nil Or Me.mDocument = Nil Then
+            Me.Status("No control selected.")
+            Return False
+        End If
+        If node.ParentId = "" Then
+            Me.Status("The layout root cannot be deleted.")
+            Return False
+        End If
+        Dim refactorHost As LayoutProjectRefactorHost = TryCast(Me.mHost, LayoutProjectRefactorHost)
+        If refactorHost = Nil Then
+            Me.Status("Project-safe delete requires a refactor host.")
+            Return False
+        End If
+        If Array.Count(Me.mSelection) <= 1 Then Return refactorHost.DeleteLayoutControl(Me.mDocument.Version, node.Id)
+        Dim names As Array Of String = []
+        For Each id As String In Me.mSelection
+            Dim selected As LayoutNode = Me.mDocument.FindNode(id)
+            If selected <> Nil And selected.ParentId <> "" Then names.Append(selected.Name)
+        Next
+        Dim deleted As Integer = 0
+        For Each name As String In names
+            If Me.mDocument = Nil Or Me.mHost = Nil Then Exit For
+            Dim target As LayoutNode = Me.FindNodeNamed(name)
+            If target = Nil Then Continue For
+            Dim version As Integer = Me.mDocument.Version
+            If Not refactorHost.DeleteLayoutControl(version, target.Id) Then Exit For
+            deleted += 1
+            ' Hosts that do not reload synchronously cannot accept further edits
+            ' against the stale snapshot.
+            If Me.mDocument = Nil Then Exit For
+            If Me.mDocument.Version = version Then Exit For
+        Next
+        If deleted = Array.Count(names) Then
+            Me.Status("Deleted " + String.From(deleted) + " controls.")
+        Else
+            Me.Status("Deleted " + String.From(deleted) + " of " + String.From(Array.Count(names)) + " controls.")
+        End If
+        Return deleted > 0
+    End Function
+
+    Public Property RefactorAvailable As Boolean
+        Get
+            Return TryCast(Me.mHost, LayoutProjectRefactorHost) <> Nil
+        End Get
+    End Property
+
+    Public Function Constraints() As JSONItem
+        If Me.mDocument = Nil Or Me.mActiveRoot = "" Then Return JSONItem.NewArray()
+        Try
+            Return Me.mDocument.Constraints(Me.mActiveRoot)
+        Catch e As InvalidArgumentException
+            Return JSONItem.NewArray()
+        End Try
+    End Function
+
+    Public Property ConstraintsSupported As Boolean
+        Get
+            If Me.mDocument = Nil Or Me.mActiveRoot = "" Then Return False
+            Dim root As LayoutNode = Me.mDocument.FindNode(Me.mActiveRoot)
+            If root = Nil Then Return False
+            Return root.TypeName = "Window"
+        End Get
+    End Property
+
+    Public Function AddConstraint(leftNodeId As String, leftAnchor As String, relation As String, rightNodeId As String, rightAnchor As String, offset As Integer, priority As String) As Boolean
+        Dim mapped As Array Of String = Me.FlushNudgeKeepingAll([leftNodeId, rightNodeId])
+        leftNodeId = mapped(0)
+        rightNodeId = mapped(1)
+        Me.CancelGesture()
+        If Me.mDocument = Nil Or Me.mHost = Nil Or Me.mActiveRoot = "" Then Return False
+        If Not Me.ConstraintsSupported Then
+            Me.Status("Constraints require a Window root.")
+            Return False
+        End If
+        Try
+            Dim edits As Array Of EditorEdit = Me.mDocument.ConstraintEdits(Me.mActiveRoot, "", leftNodeId, leftAnchor, relation, rightNodeId, rightAnchor, offset, priority)
+            Return Me.Submit(Me.mDocument.Version, edits)
+        Catch e As InvalidArgumentException
+            Me.Status(e.Message)
+            Return False
+        End Try
+    End Function
+
+    Public Function EditConstraint(constraintId As String, leftNodeId As String, leftAnchor As String, relation As String, rightNodeId As String, rightAnchor As String, offset As Integer, priority As String) As Boolean
+        Dim mapped As Array Of String = Me.FlushNudgeKeepingAll([leftNodeId, rightNodeId, constraintId])
+        leftNodeId = mapped(0)
+        rightNodeId = mapped(1)
+        constraintId = mapped(2)
+        Me.CancelGesture()
+        If Me.mDocument = Nil Or Me.mHost = Nil Or Me.mActiveRoot = "" Then Return False
+        If Not Me.ConstraintsSupported Then
+            Me.Status("Constraints require a Window root.")
+            Return False
+        End If
+        Try
+            Dim edits As Array Of EditorEdit = Me.mDocument.ConstraintEdits(Me.mActiveRoot, constraintId, leftNodeId, leftAnchor, relation, rightNodeId, rightAnchor, offset, priority)
+            Return Me.Submit(Me.mDocument.Version, edits)
+        Catch e As InvalidArgumentException
+            Me.Status(e.Message)
+            Return False
+        End Try
+    End Function
+
+    Public Function DeleteConstraint(constraintId As String) As Boolean
+        constraintId = Me.FlushNudgeKeeping(constraintId)
+        Me.CancelGesture()
+        If Me.mDocument = Nil Or Me.mHost = Nil Or Me.mActiveRoot = "" Then Return False
+        Try
+            Dim edits As Array Of EditorEdit = Me.mDocument.DeleteConstraintEdits(Me.mActiveRoot, constraintId)
+            Return Me.Submit(Me.mDocument.Version, edits)
+        Catch e As InvalidArgumentException
+            Me.Status(e.Message)
+            Return False
+        End Try
+    End Function
+
+    Public Sub RefreshCatalog()
+        Me.CancelGesture()
+        Me.ExpireBindings()
+        Me.RefreshPalette()
+        Me.RefreshInspector()
+        Me.mSurface.Invalidate()
+    End Sub
+End Class

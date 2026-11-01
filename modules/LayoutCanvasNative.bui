@@ -1,0 +1,246 @@
+Import controlsnapshot.ControlSnapshot
+
+Public Class LayoutNativeControlSpec Inherits ControlSnapshotDescriptor
+End Class
+
+Private Function LayoutNativeLiteral(values As JSONItem, name As String, fallback As String) As String
+    If values = Nil Then Return fallback
+    Dim text As Optional Of String = values.Value(name).AsString()
+    If text.HasValue Then Return text.Value
+    Return values.Value("$expressions").Value(name).AsString().Or(fallback)
+End Function
+
+Private Function LayoutNativeExpression(values As JSONItem, name As String, fallback As String) As String
+    If values = Nil Then Return fallback
+    Return values.Value("$expressions").Value(name).AsString().Or(fallback)
+End Function
+
+Private Function LayoutNativeNumber(values As JSONItem, name As String, fallback As Double) As Double
+    If values = Nil Then Return fallback
+    Return values.Value(name).AsNumber().Or(fallback)
+End Function
+
+Private Function LayoutNativeFlag(values As JSONItem, name As String, fallback As Boolean) As Boolean
+    If values = Nil Then Return fallback
+    Return values.Value(name).AsBoolean().Or(fallback)
+End Function
+
+
+''' Paints builtin controls with the operating system's own control drawing.
+Public Class LayoutNativeControlPainter
+    ''' Hosts may turn OS drawing off to force the portable approximations.
+    Public Property Enabled As Boolean = True
+    ''' Last native render failure ("" when none).
+    Public Property LastError As String = ""
+    Private Property mCache As Map Of String, Picture = New Map Of String, Picture()
+    Private Property mFailed As Map Of String, Boolean = New Map Of String, Boolean()
+    Public Property BackingScaleFactor As Double = 0.0
+    Private Property mCachedPixels As Double = 0.0
+
+    ''' Upper bound on cached snapshots before the cache is cleared wholesale.
+    Public Const CacheLimit As Integer = 256
+    ''' Upper bound on snapshot pixels (width x height) at any zoom.
+    Public Const PixelLimit As Integer = 16777216
+
+    ''' True when this build can ask the OS to draw controls.
+    Public Shared Function Supported() As Boolean
+        Return True
+    End Function
+
+    Public Function CachedCount() As Integer
+        Return Me.mCache.Count()
+    End Function
+
+    Public Sub ClearCache()
+        Me.mCache.Clear()
+        Me.mFailed.Clear()
+        Me.mCachedPixels = 0.0
+        Me.LastError = ""
+    End Sub
+
+    ''' Raster density for a snapshot: zoom times backing scale, rounded up to a
+    ''' quarter step (limits re-rendering while zooming), clamped to [1, 8] and
+    ''' reduced so rounded bitmap dimensions never exceed PixelLimit pixels.
+    ''' Zero requests the portable fallback when even quarter scale is too large.
+    Public Shared Function RasterScale(zoom As Double, backing As Double, w As Double, h As Double) As Double
+        Dim density As Double = Math.Ceiling(Math.Max(0.05, zoom) * Math.Max(1.0, backing) * 4.0) / 4.0
+        density = Math.Max(1.0, Math.Min(8.0, density))
+        Dim area As Double = Math.Max(1.0, w) * Math.Max(1.0, h)
+        If area * density * density > PixelLimit Then density = Math.Max(0.0, Math.Floor(Math.Sqrt(PixelLimit / area) * 4.0) / 4.0)
+        While density > 0.0 And (Math.Ceiling(w * density) * Math.Ceiling(h * density) > PixelLimit Or Math.Ceiling(w * density) > 32767.0 Or Math.Ceiling(h * density) > 32767.0)
+            density -= 0.25
+        End While
+        Return density
+    End Function
+
+    ''' Maps a builtin type and its renderer values (literal keys plus the exact
+    ''' $expressions object) to a native preview. Nothing is evaluated: enum and
+    ''' unsupported expressions are matched textually or use the default.
+    Public Shared Function SpecFor(typeName As String, nodeName As String, values As JSONItem, h As Double) As LayoutNativeControlSpec
+        Dim spec As New LayoutNativeControlSpec()
+        spec.Enabled = LayoutNativeFlag(values, "Enabled", True)
+        spec.FontName = LayoutNativeLiteral(values, "FontName", "")
+        spec.FontSize = Math.Max(0.0, Math.Min(256.0, LayoutNativeNumber(values, "FontSize", 0.0)))
+        Select Case typeName
+            Case "Button"
+                spec.Kind = "button"
+                spec.Title = LayoutNativeLiteral(values, "Caption", nodeName)
+            Case "Label"
+                spec.Kind = "label"
+                spec.Text = LayoutNativeLiteral(values, "Text", nodeName)
+            Case "TextField", "SearchField"
+                spec.Kind = "textfield"
+                If typeName = "SearchField" Then spec.Kind = "search"
+                spec.Text = LayoutNativeLiteral(values, "Text", "")
+                spec.Placeholder = LayoutNativeLiteral(values, "Placeholder", "")
+                spec.Flag = LayoutNativeExpression(values, "FieldType", "") = "FieldType.Password"
+            Case "ComboBox", "PopupMenu"
+                ' Runtime ComboBox: NSPopUpButton unless IsEditable (NSComboBox).
+                spec.Text = LayoutNativeLiteral(values, "Text", "")
+                If typeName = "ComboBox" And LayoutNativeFlag(values, "IsEditable", False) Then
+                    spec.Kind = "combo"
+                Else
+                    spec.Kind = "popup"
+                    spec.Items = [spec.Text]
+                End If
+            Case "DateTimePicker"
+                spec.Kind = "date"
+                ' NSDatePickerElementFlag: YearMonthDay 0xE0, HourMinute 0x0C.
+                Select Case LayoutNativeExpression(values, "Mode", "DateTimePickerMode.DateTime")
+                    Case "DateTimePickerMode.Date"
+                        spec.Elements = 224
+                    Case "DateTimePickerMode.Time"
+                        spec.Elements = 12
+                    Case Else
+                        spec.Elements = 236
+                End Select
+            Case "TextArea"
+                spec.Kind = "textarea"
+                spec.Text = LayoutNativeLiteral(values, "Text", "")
+            Case "Checkbox"
+                spec.Kind = "checkbox"
+                spec.Title = LayoutNativeLiteral(values, "Caption", nodeName)
+                Select Case LayoutNativeExpression(values, "Value", "Checkbox.CheckState.False")
+                    Case "Checkbox.CheckState.True", "True"
+                        spec.State = 1
+                    Case "Checkbox.CheckState.Indeterminate"
+                        spec.State = -1
+                    Case Else
+                        spec.State = 0
+                End Select
+            Case "RadioButton"
+                spec.Kind = "radio"
+                spec.Title = LayoutNativeLiteral(values, "Caption", nodeName)
+                If LayoutNativeFlag(values, "Value", False) Then spec.State = 1
+            Case "RadioGroup"
+                spec.Kind = "radiogroup"
+                Dim rowCount As Integer = Math.Floor(h / 22.0)
+                Dim rows As Integer = Math.Max(1, Math.Min(4, rowCount))
+                For row As Integer = 1 To rows
+                    spec.Items.Append("Option " + String.From(row))
+                Next
+            Case "DisclosureTriangle"
+                spec.Kind = "disclosure"
+                #If TargetWindows Then
+                    spec.Kind = "" ' Runtime uses an owner-drawn chevron, not native chrome.
+                #End If
+                If LayoutNativeFlag(values, "Expanded", False) Then spec.State = 1
+            Case "Slider", "ProgressBar", "Stepper"
+                spec.Kind = "slider"
+                If typeName = "ProgressBar" Then spec.Kind = "progress"
+                If typeName = "Stepper" Then spec.Kind = "stepper"
+                spec.Minimum = LayoutNativeNumber(values, "Minimum", 0.0)
+                spec.Maximum = LayoutNativeNumber(values, "Maximum", 100.0)
+                spec.Value = Math.Max(spec.Minimum, Math.Min(spec.Maximum, LayoutNativeNumber(values, "Value", 0.0)))
+                If typeName = "Slider" Then spec.Flag = LayoutNativeExpression(values, "Orientation", "") = "Orientation.Vertical"
+                If typeName = "ProgressBar" Then spec.Flag = LayoutNativeFlag(values, "Indeterminate", False)
+            Case "TabView"
+                spec.Kind = "tabs"
+                spec.Items = ["Tab 1", "Tab 2", "Tab 3"]
+            Case "ListBox"
+                spec.Kind = "list"
+                spec.Title = "Column"
+                spec.RowHeight = LayoutNativeNumber(values, "DefaultRowHeight", 24.0)
+        End Select
+        Return spec
+    End Function
+
+    ''' Cache key: visual spec, exact logical size, appearance and raster density.
+    Public Shared Function CacheKey(spec As LayoutNativeControlSpec, w As Double, h As Double, dark As Boolean, scale As Double) As String
+        Dim size As String = String.From(w) + "x" + String.From(h)
+        Dim appearance As String = "light"
+        If dark Then appearance = "dark"
+        Return spec.Key() + "\n" + size + "\n" + appearance + "\n" + String.From(scale)
+    End Function
+
+    Private Function BackingScale() As Double
+        If Me.BackingScaleFactor > 0.0 Then Return Me.BackingScaleFactor
+        Return ControlSnapshot.BackingScale()
+    End Function
+
+    ''' OS-drawn snapshot for the control, from the cache when possible; Nil when
+    ''' this platform or control has no native drawing.
+    Public Function Snapshot(typeName As String, nodeName As String, w As Double, h As Double, values As JSONItem, dark As Boolean, zoom As Double) As Picture
+        If Not Me.Enabled Or Not LayoutNativeControlPainter.Supported() Then Return Nil
+        If Not (w >= 1.0 And h >= 1.0 And w <= 100000.0 And h <= 100000.0) Then Return Nil
+        Dim spec As LayoutNativeControlSpec = LayoutNativeControlPainter.SpecFor(typeName, nodeName, values, h)
+        If spec.Kind = "" Then Return Nil
+        Return Me.Render(spec, typeName, w, h, dark, zoom)
+    End Function
+
+    Private Function Render(spec As LayoutNativeControlSpec, label As String, w As Double, h As Double, dark As Boolean, zoom As Double) As Picture
+        Dim scale As Double = LayoutNativeControlPainter.RasterScale(zoom, Me.BackingScale(), w, h)
+        If scale <= 0.0 Then Return Nil
+        Dim pixels As Double = Math.Ceiling(w * scale) * Math.Ceiling(h * scale)
+        Dim key As String = LayoutNativeControlPainter.CacheKey(spec, w, h, dark, scale) + "\n" + ControlSnapshot.AppearanceKey()
+        Dim cached As Optional Of Picture = Me.mCache.Get(key)
+        If cached.HasValue Then Return cached.Value
+        If Me.mFailed.ContainsKey(key) Then Return Nil
+        Dim snapshot As Picture = Nil
+        Dim outcome As ControlSnapshotOutcome = ControlSnapshot.TryRender(spec, w, h, scale, dark)
+        snapshot = outcome.Image
+        If snapshot = Nil Then Me.LastError = label + ": " + outcome.Status + " " + outcome.Message
+
+        If snapshot = Nil Then
+            If Me.mFailed.Count() >= LayoutNativeControlPainter.CacheLimit Then Me.mFailed.Clear()
+            Me.mFailed.Set(key, True)
+            Return Nil
+        End If
+        ' Bound total decoded pixels as well as entry count (roughly 64 MiB RGBA).
+        If Me.mCache.Count() >= LayoutNativeControlPainter.CacheLimit Or Me.mCachedPixels + pixels > LayoutNativeControlPainter.PixelLimit Then
+            Me.mCache.Clear()
+            Me.mCachedPixels = 0.0
+        End If
+        Me.LastError = ""
+        Me.mCache.Set(key, snapshot)
+        Me.mCachedPixels += pixels
+        Return snapshot
+    End Function
+
+    ''' Draws an OS segmented control (equal segments, one selected) for host
+    ''' chrome such as mode switches. Returns False when the caller must paint
+    ''' its own; hit-testing stays with the caller.
+    Public Function PaintSegments(g As IGraphics, labels As Array Of String, selected As Integer, x As Double, y As Double, w As Double, h As Double, dark As Boolean, zoom As Double) As Boolean
+        If Not Me.Enabled Or Not LayoutNativeControlPainter.Supported() Then Return False
+        If Array.Count(labels) = 0 Or Not (w >= 1.0 And h >= 1.0 And w <= 100000.0 And h <= 100000.0) Then Return False
+        Dim spec As New LayoutNativeControlSpec()
+        spec.Kind = "segments"
+        spec.Items = labels
+        spec.State = Math.Max(-1, Math.Min(Array.LastIndex(labels), selected))
+        Dim image As Picture = Me.Render(spec, spec.Kind, w, h, dark, zoom)
+        If image = Nil Then Return False
+        g.DrawPicture(image, x, y, w, h)
+        Return True
+    End Function
+
+    ''' Draws the OS rendering into (x, y, w, h) in the caller's coordinate space
+    ''' (zoom and clipping come from g). Returns False when the caller must paint
+    ''' its own approximation.
+    Public Function Paint(g As IGraphics, typeName As String, nodeName As String, x As Double, y As Double, w As Double, h As Double, values As JSONItem, dark As Boolean, zoom As Double) As Boolean
+        Dim image As Picture = Me.Snapshot(typeName, nodeName, w, h, values, dark, zoom)
+        If image = Nil Then Return False
+        g.DrawPicture(image, x, y, w, h)
+        Return True
+    End Function
+End Class
+

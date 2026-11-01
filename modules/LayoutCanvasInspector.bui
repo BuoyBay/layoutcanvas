@@ -1,0 +1,3323 @@
+Import layoutcanvas.LayoutCanvasWheel
+Import editorkit
+Import layoutkit.LayoutDocument
+Import layoutkit.LayoutCatalog
+Import layoutkit.LayoutRefactor
+Import layoutkit.LayoutRelations
+
+' Inspector panel: header (root picker, selection identity, mode switch), a
+' filterable, sectioned property grid drawn on a Canvas with a single native
+' editor overlaid on the active row, a detail line, and the constraints editor.
+
+Private Class LayoutRootPicker Inherits ComboBox
+    Public Property Owner As LayoutEditor
+    Handle SelectionChanged()
+        If Me.Owner <> Nil Then Me.Owner.SelectRootIndex(Me.SelectedIndex)
+    End Handle
+End Class
+
+''' Each custom view gets a binding that expires on selection, reload or detach.
+Private Class LayoutPropertyBinding Implements LayoutPropertyEditorHost, LayoutPropertyEditorContextV1
+    Public Property Owner As LayoutEditor
+    Public Property NodeId As String
+    Public Property PropertyName As String
+    Public Property Version As Integer
+    Public Property Generation As Integer
+    Public Property Snapshot As LayoutDocument
+    Public Function IsCurrent() As Boolean
+        If Me.Owner Is Nil Then Return False
+        Return Me.Owner.BoundPropertyIsCurrent(Me.NodeId, Me.PropertyName, Me.Version, Me.Generation, Me.Snapshot)
+    End Function
+    Public Function SiblingExpression(propertyName As String) As Optional Of String
+        If Me.Snapshot Is Nil Then Return None
+        Dim node As LayoutNode = Me.Snapshot.FindNode(Me.NodeId)
+        If node Is Nil Then Return None
+        For Each prop As LayoutProperty In node.Properties
+            If prop.Name = propertyName Then Return Some(prop.RawValue)
+        Next
+        Return None
+    End Function
+    Public Function CommitExpression(expression As String) As Boolean
+        If Me.Owner = Nil Then Return False
+        Return Me.Owner.CommitBoundProperty(Me.NodeId, Me.PropertyName, Me.Version, Me.Generation, Me.Snapshot, expression)
+    End Function
+End Class
+
+''' One line of the inspector grid. Rows are rebuilt from the document snapshot.
+Private Class LayoutInspectorRow
+    ' section | name | type | geometry | property | info | message | buttons |
+    ' constraint | cfield | cbuttons
+    Public Property Kind As String = "property"
+    Public Property Key As String = ""
+    Public Property Label As String = ""
+    Public Property Value As String = ""
+    Public Property EditText As String = ""
+    Public Property Section As String = ""
+    ' name | geometry | text | number | bool | enum | raw | custom | plugin | readonly | none
+    Public Property Editor As String = "none"
+    Public Property KindName As String = ""
+    Public Property PropertyIndex As Integer = -1
+    Public Property Detail As String = ""
+    Public Property Mixed As Boolean = False
+    Public Property Checked As Boolean = False
+    Public Property Present As Boolean = True
+    Public Property Monospace As Boolean = False
+    Public Property Options As Array Of String = []
+    Public Property OptionLabels As Array Of String = []
+    Public Property Commands As Array Of String = []
+    Public Property CommandEnabled As Array Of Boolean = []
+    Public Property HasSwatch As Boolean = False
+    Public Property Swatch As Color = Color.Clear
+    Public Property Count As Integer = 0
+    Public Property Height As Integer = 24
+    Public Property Minimum As Optional Of Double = None
+    Public Property Maximum As Optional Of Double = None
+    Public Property StepValue As Double = 1.0
+End Class
+
+Private Class LayoutInspectorGrid Inherits LayoutWheelCanvas
+    Public Property Owner As LayoutEditor
+    Public Overrides Function NativeWheel(dx As Double, dy As Double, pixels As Boolean) As Boolean
+        If Me.Owner = Nil Then Return False
+        Return Me.Owner.InspectorWheel(dx, dy, pixels)
+    End Function
+    Handle Paint(g As Graphics)
+        If Me.Owner <> Nil Then Me.Owner.InspectorPaintGrid(g)
+    End Handle
+    Handle MouseDown(e As MouseEvent)
+        If Me.Owner = Nil Then Return
+        Me.Focus()
+        Me.Owner.InspectorGridMouseDown(e.X, e.Y, e.ClickCount, e.Button <> MouseButton.Left)
+        e.Handled = True
+    End Handle
+    Handle MouseDrag(e As MouseEvent)
+        If Me.Owner <> Nil Then Me.Owner.InspectorGridMouseDrag(e.X, e.Y)
+    End Handle
+    Handle MouseUp(e As MouseEvent)
+        If Me.Owner <> Nil Then Me.Owner.InspectorGridMouseUp()
+    End Handle
+    Handle MouseMove(e As MouseEvent)
+        If Me.Owner <> Nil Then Me.Owner.InspectorGridHover(e.X, e.Y)
+    End Handle
+    Handle MouseExit(e As MouseEvent)
+        If Me.Owner <> Nil Then Me.Owner.InspectorGridHover(-1.0, -1.0)
+    End Handle
+    Handle KeyDown(e As KeyEvent)
+        If Me.Owner = Nil Then Return
+        If Me.Owner.InspectorGridKey(e.Key, e.Modifiers.Shift) Then e.Handled = True
+    End Handle
+End Class
+
+''' Background and header: selection identity and the Properties/Constraints switch.
+Private Class LayoutInspectorBackdrop Inherits Canvas
+    Public Property Owner As LayoutEditor
+    Handle Paint(g As Graphics)
+        If Me.Owner <> Nil Then Me.Owner.InspectorPaintBackdrop(g)
+    End Handle
+    Handle MouseDown(e As MouseEvent)
+        If Me.Owner <> Nil And e.Button = MouseButton.Left Then Me.Owner.InspectorBackdropClick(e.X, e.Y)
+    End Handle
+    Handle KeyDown(e As KeyEvent)
+        If Me.Owner <> Nil Then
+            If Me.Owner.InspectorModeKey(e.Key) Then e.Handled = True
+        End If
+    End Handle
+End Class
+
+Private Class LayoutInspectorDetail Inherits Canvas
+    Public Property Owner As LayoutEditor
+    Handle Paint(g As Graphics)
+        If Me.Owner <> Nil Then Me.Owner.InspectorPaintDetail(g)
+    End Handle
+End Class
+
+Private Class LayoutInspectorField Inherits TextField
+    Public Property Owner As LayoutEditor
+    Public Property Purpose As String = "value"
+    Handle KeyDown(e As KeyEvent)
+        If Me.Owner = Nil Then Return
+        If Me.Owner.InspectorFieldKey(Me.Purpose, e.Key, e.Modifiers.Shift) Then e.Handled = True
+    End Handle
+    Handle FocusLost()
+        If Me.Owner <> Nil Then Me.Owner.InspectorFieldFinished(Me.Purpose)
+    End Handle
+    Handle TextChanged()
+        If Me.Owner <> Nil Then Me.Owner.InspectorFieldChanged(Me.Purpose)
+    End Handle
+End Class
+
+Private Class LayoutInspectorPopup Inherits ComboBox
+    Public Property Owner As LayoutEditor
+    Public Property Purpose As String = "value"
+    Handle SelectionChanged()
+        If Me.Owner <> Nil Then Me.Owner.InspectorPopupChanged(Me.Purpose)
+    End Handle
+End Class
+
+Public Partial Class LayoutEditor
+    Private Property mRootPicker As LayoutRootPicker = New LayoutRootPicker()
+    Private Property mInspector As View = New View()
+    Private Property mInspectorBackdrop As LayoutInspectorBackdrop = New LayoutInspectorBackdrop()
+    Private Property mInspectorGrid As LayoutInspectorGrid = New LayoutInspectorGrid()
+    Private Property mInspectorDetail As LayoutInspectorDetail = New LayoutInspectorDetail()
+    Private Property mInspectorFilter As LayoutInspectorField = New LayoutInspectorField()
+    Private Property mValueField As LayoutInspectorField = New LayoutInspectorField()
+    Private Property mValuePopup As LayoutInspectorPopup = New LayoutInspectorPopup()
+    Private Property mAllRows As Array Of LayoutInspectorRow = []
+    Private Property mRows As Array Of LayoutInspectorRow = []
+    Private Property mCollapsedSections As Array Of String = []
+    Private Property mFilterText As String = ""
+    Private Property mActiveKey As String = ""
+    Private Property mHoverKey As String = ""
+    Private Property mHoverButton As Integer = -1
+    Private Property mInspectorScroll As Integer = 0
+    Private Property mInspectorWheelRemainder As Double = 0.0
+    Private Property mInspectorCollapsed As Boolean = False
+    Private Property mInspectorWidth As Integer = 280
+    Private Property mInspectorX As Integer = 0
+    Private Property mInspectorY As Integer = 0
+    Private Property mInspectorW As Integer = 280
+    Private Property mInspectorH As Integer = 500
+    Private Property mGridTop As Integer = 0
+    Private Property mGridHeight As Integer = 1
+    Private Property mDetailHeight As Integer = 64
+    Private Property mHeaderTop As Integer = 48
+    Private Property mSegmentTop As Integer = 90
+    Private Property mFilterTop As Integer = 124
+    Private Property mEditKey As String = ""
+    Private Property mEditOriginal As String = ""
+    Private Property mEditVersion As Integer = -1
+    Private Property mEditNodes As String = ""
+    Private Property mEditBinding As Boolean = False
+    Private Property mInspectorBusy As Boolean = False
+    Private Property mShowDepth As Integer = 0
+    Private Property mScrollDrag As Boolean = False
+    Private Property mScrollDragStart As Double = 0.0
+    Private Property mScrollDragOrigin As Integer = 0
+    Private Property mPropertyDetail As String = ""
+    Private Property mActiveCustom As View
+    Private Property mPresentCount As Integer = 0
+    Private Property mCustomAllocations As Integer = 0
+    Private Property mCustomFactories As Array Of LayoutPropertyViewFactory = []
+    Private Property mFailedFactories As Array Of LayoutPropertyViewFactory = []
+    Private Property mFailedEditors As Array Of LayoutPropertyEditor = []
+    Private Property mCustomViews As Array Of View = []
+    Private Property mBindings As Array Of LayoutPropertyBinding = []
+    Private Property mProperty As LayoutProperty
+    Private Property mInspectorProperties As Array Of LayoutProperty = []
+    Private Property mDescriptor As LayoutPropertyDescriptor
+    Private Property mPropertyMode As String = "readonly"
+    Private Property mMode As String = "properties"
+    Private Property mConstraintLeftNode As ComboBox = New ComboBox()
+    Private Property mConstraintLeftAnchor As ComboBox = New ComboBox()
+    Private Property mConstraintRelation As ComboBox = New ComboBox()
+    Private Property mConstraintRightNode As ComboBox = New ComboBox()
+    Private Property mConstraintRightAnchor As ComboBox = New ComboBox()
+    Private Property mConstraintOffset As LayoutInspectorField = New LayoutInspectorField()
+    Private Property mConstraintPriority As ComboBox = New ComboBox()
+    Private Property mConstraintIndex As Integer = 0
+    Private Property mConstraintNodeIds As Array Of String = []
+    Private Property mConstraintIds As Array Of String = []
+
+    ' ------------------------------------------------------------------
+    ' Custom editor lifecycle (legacy semantics)
+    ' ------------------------------------------------------------------
+
+    ' Legacy factories are retained by View; at most 16 are attached per editor
+    ' lifetime. Once exhausted, literal fields remain available with explicit status.
+    ' Bindings are never recycled: retained callbacks stay permanently expired.
+    Public Property CustomViewCount As Integer
+        Get
+            Return Array.Count(Me.mCustomViews)
+        End Get
+    End Property
+
+    Private Sub ExpireBindings()
+        Me.mGeneration += 1
+        For Each binding As LayoutPropertyBinding In Me.mBindings
+            binding.Owner = Nil
+            binding.Snapshot = Nil
+        Next
+        Me.mBindings = []
+        For Each custom As View In Me.mCustomViews
+            custom.Visible = False
+            custom.Enabled = False
+        Next
+        Me.mActiveCustom = Nil
+    End Sub
+
+    ' ------------------------------------------------------------------
+    ' Public inspector API
+    ' ------------------------------------------------------------------
+
+    ''' Commits the active geometry row's editor (legacy "Apply frame").
+    Public Sub ApplyGeometryFields()
+        Dim row As LayoutInspectorRow = Me.FindInspectorRow(Me.mActiveKey)
+        If row = Nil Then Return
+        If row.Editor <> "geometry" Then Return
+        Me.CommitInspectorText(row.Key, Me.mValueField.Text)
+    End Sub
+
+    Public Function SelectProperty(name As String) As Boolean
+        For i As Integer = 0 To Array.Count(Me.mInspectorProperties) - 1
+            If LayoutInspectorKit.SameText(Me.mInspectorProperties(i).Name, name) Then
+                Me.ShowProperty(i)
+                Me.RevealInspectorRow("prop:" + name)
+                Return True
+            End If
+        Next
+        Return False
+    End Function
+
+    Public Property InspectorExpression As String
+        Get
+            If Me.mProperty = Nil Then Return ""
+            Return Me.mProperty.RawValue
+        End Get
+    End Property
+
+    Public Property InspectorReadOnly As Boolean
+        Get
+            Return Me.mPropertyMode = "readonly"
+        End Get
+    End Property
+
+    ''' Visible inspector rows as JSON objects (key, kind, section, label, value,
+    ''' editor, kindName, mixed, checked, present, active, detail, options, commands).
+    Public Function InspectorRows() As JSONItem
+        Dim rowsJson As JSONItem = JSONItem.NewArray()
+        For Each row As LayoutInspectorRow In Me.mRows
+            Dim item As JSONItem = JSONItem.NewObject()
+            item.Value("key") = row.Key
+            item.Value("kind") = row.Kind
+            item.Value("section") = row.Section
+            item.Value("label") = row.Label
+            item.Value("value") = row.Value
+            item.Value("editor") = row.Editor
+            item.Value("kindName") = row.KindName
+            item.Value("mixed") = row.Mixed
+            item.Value("checked") = row.Checked
+            item.Value("present") = row.Present
+            item.Value("active") = LayoutInspectorKit.SameText(row.Key, Me.mActiveKey)
+            item.Value("detail") = row.Detail
+            Dim options As JSONItem = JSONItem.NewArray()
+            For Each optionLabel As String In row.OptionLabels
+                options.Add(optionLabel)
+            Next
+            item.Value("options") = options
+            Dim commands As JSONItem = JSONItem.NewArray()
+            For Each command As String In row.Commands
+                commands.Add(command)
+            Next
+            item.Value("commands") = commands
+            rowsJson.Add(item)
+        Next
+        Return rowsJson
+    End Function
+
+    ''' Key of the active inspector row ("name", "x", "prop:Caption", ...).
+    Public Property ActiveInspectorRow As String
+        Get
+            Return Me.mActiveKey
+        End Get
+    End Property
+
+    ''' Text currently shown in the overlaid value editor ("" when hidden).
+    Public Property InspectorEditorText As String
+        Get
+            If Not Me.mValueField.Visible Then Return ""
+            Return Me.mValueField.Text
+        End Get
+    End Property
+
+    Public Property InspectorFilter As String
+        Get
+            Return Me.mFilterText
+        End Get
+        Set
+            Me.mFilterText = value
+            If Not LayoutInspectorKit.SameText(Me.mInspectorFilter.Text, value) Then Me.mInspectorFilter.Text = value
+            Me.mInspectorScroll = 0
+            Me.ApplyRowFilter()
+            Me.InspectorRowsChanged()
+        End Set
+    End Property
+
+    Public Function InspectorSectionCollapsed(name As String) As Boolean
+        Return Array.Contains(Me.mCollapsedSections, name)
+    End Function
+
+    Public Function ToggleInspectorSection(name As String) As Boolean
+        Dim found As Boolean = False
+        For Each row As LayoutInspectorRow In Me.mAllRows
+            If row.Kind = "section" And row.Label = name Then found = True
+        Next
+        If Not found Then Return False
+        If Array.Contains(Me.mCollapsedSections, name) Then
+            Dim kept As Array Of String = []
+            For Each section As String In Me.mCollapsedSections
+                If section <> name Then kept.Append(section)
+            Next
+            Me.mCollapsedSections = kept
+        Else
+            Me.mCollapsedSections.Append(name)
+        End If
+        Me.ApplyRowFilter()
+        Me.InspectorRowsChanged()
+        Return True
+    End Function
+
+    ''' Makes a row active (property rows also bind custom/plugin editors).
+    Public Function ActivateInspectorRow(key As String) As Boolean
+        Dim row As LayoutInspectorRow = Me.FindInspectorRow(key)
+        If row = Nil Then Return False
+        If row.Kind = "property" And row.PropertyIndex >= 0 Then
+            Me.ShowProperty(row.PropertyIndex)
+        Else
+            If Me.mProperty <> Nil Or Me.mActiveCustom <> Nil Then
+                Me.ExpireBindings()
+                Me.mProperty = Nil
+                Me.mDescriptor = Nil
+                Me.mPropertyMode = "readonly"
+                Me.mPropertyDetail = ""
+            End If
+            Me.mActiveKey = row.Key
+            Me.InspectorRowsChanged()
+        End If
+        Me.RevealInspectorRow(row.Key)
+        Return True
+    End Function
+
+    ''' Commits a value as if typed into the row's editor and confirmed with Return.
+    ''' Booleans take True/False; enums take an option expression or its short label.
+    Public Function CommitInspectorRow(key As String, value As String) As Boolean
+        Dim row As LayoutInspectorRow = Me.FindInspectorRow(key)
+        If row = Nil Then Return False
+        If Not LayoutInspectorKit.SameText(key, Me.mActiveKey) Then Me.ActivateInspectorRow(key)
+        Return Me.CommitInspectorText(key, value)
+    End Function
+
+    ''' Increments a numeric or geometry row by delta steps (arrow keys / stepper).
+    Public Function StepInspectorRow(key As String, delta As Integer) As Boolean
+        Dim row As LayoutInspectorRow = Me.FindInspectorRow(key)
+        If row = Nil Then Return False
+        If Not LayoutInspectorKit.SameText(key, Me.mActiveKey) Then Me.ActivateInspectorRow(key)
+        Return Me.StepInspectorValue(key, delta)
+    End Function
+
+    ''' Double-click behaviour: show Properties, select the primary text-like
+    ''' property and focus its editor. Returns whether an editor was focused.
+    Public Function EditPrimaryProperty() As Boolean
+        Return Me.FocusInspectorRow(Me.PrimaryPropertyKeyFor())
+    End Function
+
+    ''' Commits the overlay editor and forgets it so a later native FocusLost
+    ''' cannot re-enter a designer command. Win32 delivers WM_KILLFOCUS during
+    ''' the next Action while GTK/AppKit typically finish FocusLost first.
+    Public Sub FinishInspectorEdit()
+        Me.CommitValueField(False)
+        Me.mEditKey = ""
+        Me.mEditOriginal = ""
+    End Sub
+
+    Public Property InspectorVisible As Boolean
+        Get
+            Return Not Me.mInspectorCollapsed
+        End Get
+        Set
+            If Me.mInspectorCollapsed <> value Then Return
+            Me.mInspectorCollapsed = Not value
+            Me.RelayoutPanel()
+        End Set
+    End Property
+
+    Public Property InspectorWidth As Integer
+        Get
+            Return Me.mInspectorWidth
+        End Get
+        Set
+            Me.mInspectorWidth = Math.Max(220, Math.Min(560, value))
+            Me.RelayoutPanel()
+        End Set
+    End Property
+
+    Public Property InspectorMode As String
+        Get
+            Return Me.mMode
+        End Get
+        Set
+            If value <> "properties" And value <> "palette" And value <> "constraints" Then Return
+            If value = "palette" Then
+                ' Legacy mode: the palette is its own tool column now. Reveal it and
+                ' keep the inspector on its properties.
+                Me.RevealPalette()
+                value = "properties"
+            End If
+            Dim previous As String = Me.mMode
+            Me.mMode = value
+            Me.mInspectorScroll = 0
+            Me.RefreshInspector()
+            If previous <> value Then Me.RelayoutInspector()
+        End Set
+    End Property
+
+    Public Sub SetInspectorModeIndex(index As Integer)
+        If index = 0 Then Me.InspectorMode = "properties"
+        If index = 1 Then Me.InspectorMode = "palette"
+        If index = 2 Then Me.InspectorMode = "constraints"
+    End Sub
+
+    Public Sub PerformAction(action As String)
+        Select Case action
+            Case "insert"
+                Me.InsertFromPalette()
+            Case "arm"
+                Me.ArmFromPalette()
+            Case "rename"
+                If LayoutInspectorKit.SameText(Me.mEditKey, "name") Then Me.CommitInspectorText("name", Me.mValueField.Text)
+            Case "delete"
+                Me.DeleteSelected()
+            Case "constraintApply"
+                Me.ApplyConstraintFromFields()
+            Case "constraintDelete"
+                Me.DeleteConstraintFromField()
+        End Select
+    End Sub
+
+    ' ------------------------------------------------------------------
+    ' Refresh and row model
+    ' ------------------------------------------------------------------
+
+    Private Sub RefreshInspector()
+        Me.UpdateStageAccessibility()
+        Me.ExpireBindings()
+        Me.mProperty = Nil
+        Me.mDescriptor = Nil
+        Me.mPropertyMode = "readonly"
+        Me.mPropertyDetail = ""
+        ' Palette state (armed placement highlight, insert availability) follows the document.
+        Me.RefreshPaletteMode()
+        If Me.mMode = "constraints" Then
+            Me.RefreshConstraintsMode()
+        Else
+            Me.RefreshPropertiesMode()
+        End If
+    End Sub
+
+    Private Function InspectorSelection() As Array Of String
+        Dim ids As Array Of String = []
+        If Me.mDocument = Nil Then Return ids
+        For Each id As String In Me.SelectedIds()
+            Dim node As LayoutNode = Me.mDocument.FindNode(id)
+            If node = Nil Then Continue For
+            If Me.InActiveRoot(node) Then ids.Append(id)
+        Next
+        Return ids
+    End Function
+
+    Private Sub RefreshPropertiesMode()
+        Me.mInspectorProperties = []
+        Me.mPresentCount = 0
+        Dim rows As Array Of LayoutInspectorRow = []
+        Dim ids As Array Of String = Me.InspectorSelection()
+        Dim node As LayoutNode = Me.CurrentNode()
+        If Array.Count(ids) > 1 Then
+            Me.BuildMultiRows(ids, rows)
+        ElseIf node <> Nil Then
+            For Each prop As LayoutProperty In node.Properties
+                Me.mInspectorProperties.Append(prop)
+            Next
+            Me.mPresentCount = Array.Count(Me.mInspectorProperties)
+            Dim control As LayoutControlDescriptor = Me.ResolveDescriptor(node.TypeName)
+            If control <> Nil Then
+                For Each descriptor As LayoutPropertyDescriptor In control.Properties
+                    Dim present As Boolean = False
+                    For Each prop As LayoutProperty In node.Properties
+                        If prop.Name = descriptor.Name Then present = True
+                    Next
+                    If Not present Then Me.mInspectorProperties.Append(New LayoutProperty(descriptor.Name, descriptor.DefaultExpression, False))
+                Next
+            End If
+            Me.BuildNodeRows(node, control, rows)
+        Else
+            Dim message As String = "Select a control on the canvas to inspect it."
+            If Me.mDocument = Nil Then message = "Open a layout to inspect its controls."
+            rows.Append(Me.MessageRow(message))
+        End If
+        Me.mAllRows = rows
+        Me.ApplyRowFilter()
+        Dim restore As String = Me.mActiveKey
+        If Array.Count(ids) = 1 And node <> Nil Then
+            ' Keep the active row across selections and reloads. Reentrant refreshes
+            ' (plugin callbacks) fall back to the first property like the legacy picker.
+            Dim restored As Boolean = False
+            If Me.mShowDepth = 0 And String.Left(restore, 5) = "prop:" Then
+                restored = Me.SelectPropertyQuiet(String.Substring(restore, 5))
+            End If
+            If Not restored Then
+                If Array.Count(Me.mInspectorProperties) > 0 Then Me.ShowProperty(0)
+                If Me.mShowDepth = 0 And restore <> "" And String.Left(restore, 5) <> "prop:" And Me.FindInspectorRow(restore) <> Nil Then
+                    If Me.mProperty <> Nil Then
+                        Me.ExpireBindings()
+                        Me.mProperty = Nil
+                        Me.mDescriptor = Nil
+                        Me.mPropertyMode = "readonly"
+                    End If
+                    Me.mActiveKey = restore
+                End If
+            End If
+        ElseIf Array.Count(ids) > 1 Then
+            If Me.FindInspectorRow(restore) = Nil Then Me.mActiveKey = "x"
+        End If
+        Me.InspectorRowsChanged()
+    End Sub
+
+    Private Function SelectPropertyQuiet(name As String) As Boolean
+        For i As Integer = 0 To Array.Count(Me.mInspectorProperties) - 1
+            If LayoutInspectorKit.SameText(Me.mInspectorProperties(i).Name, name) Then
+                Me.ShowProperty(i)
+                Return True
+            End If
+        Next
+        Return False
+    End Function
+
+    Private Function NewRow(kind As String, key As String, label As String, section As String) As LayoutInspectorRow
+        Dim row As New LayoutInspectorRow()
+        row.Kind = kind
+        row.Key = key
+        row.Label = label
+        row.Section = section
+        row.Height = Me.InspectorRowHeight()
+        Return row
+    End Function
+
+    Private Function SectionRow(name As String) As LayoutInspectorRow
+        Dim row As LayoutInspectorRow = Me.NewRow("section", "section:" + name, name, name)
+        row.Height = Me.InspectorRowHeight() + 2
+        Return row
+    End Function
+
+    Private Function MessageRow(text As String) As LayoutInspectorRow
+        Dim row As LayoutInspectorRow = Me.NewRow("message", "message", text, "")
+        row.Value = text
+        row.Height = 44
+        Return row
+    End Function
+
+    Private Sub BuildNodeRows(node As LayoutNode, control As LayoutControlDescriptor, rows As Array Of LayoutInspectorRow)
+        ' Scalar settings stay editable inside constrained layouts (legacy rule); only
+        ' geometry additionally needs an editable, literal Frame.
+        Dim canEdit As Boolean = Me.IsCanvasNode(node) And Me.mHost <> Nil
+        rows.Append(Me.SectionRow("ID"))
+        Dim nameRow As LayoutInspectorRow = Me.NewRow("name", "name", "Name", "ID")
+        nameRow.Value = node.Name
+        nameRow.EditText = node.Name
+        nameRow.KindName = "identifier"
+        If Me.RefactorAvailable And node.Editable Then
+            nameRow.Editor = "name"
+            nameRow.Detail = "Renames the control and updates code references (project-safe refactor)."
+        Else
+            nameRow.Editor = "readonly"
+            nameRow.Detail = "Renaming needs an editable control and a host with project-safe refactoring."
+        End If
+        rows.Append(nameRow)
+        Dim typeRow As LayoutInspectorRow = Me.NewRow("type", "type", "Type", "ID")
+        typeRow.Value = node.TypeName
+        typeRow.Editor = "readonly"
+        typeRow.KindName = "type"
+        typeRow.Detail = "The control class. Change it in source."
+        If control <> Nil Then
+            If control.PackageName <> "builtin" Then typeRow.Detail = "Provided by package " + control.PackageName + "."
+        Else
+            typeRow.Detail = "No catalog descriptor; properties are shown as written."
+        End If
+        rows.Append(typeRow)
+
+        rows.Append(Me.SectionRow("Position"))
+        Dim canFrame As Boolean = canEdit And node.Editable And node.HasLiteralFrame
+        Dim labels As Array Of String = ["X", "Y", "Width", "Height"]
+        Dim keys As Array Of String = ["x", "y", "width", "height"]
+        Dim values As Array Of Integer = [node.X, node.Y, node.Width, node.Height]
+        For i As Integer = 0 To 3
+            Dim row As LayoutInspectorRow = Me.NewRow("geometry", keys(i), labels(i), "Position")
+            row.Value = String.From(values(i))
+            row.EditText = row.Value
+            row.KindName = "integer"
+            If canFrame Then
+                row.Editor = "geometry"
+                row.Detail = "Points, relative to the parent. Up/Down steps by 1 (Shift: 10)."
+                If i >= 2 Then row.Minimum = Some(1.0)
+            Else
+                row.Editor = "readonly"
+                row.Detail = Me.ReadOnlyGeometryReason(node)
+            End If
+            rows.Append(row)
+        Next
+
+        ' Group descriptor-backed rows by Category in descriptor order, then "Other".
+        Dim sections As Array Of String = []
+        Dim grouped As Array Of LayoutInspectorRow = []
+        Dim used As Array Of Integer = []
+        If control <> Nil Then
+            For Each descriptor As LayoutPropertyDescriptor In control.Properties
+                For i As Integer = 0 To Array.Count(Me.mInspectorProperties) - 1
+                    If Me.mInspectorProperties(i).Name = descriptor.Name And Not Array.Contains(used, i) Then
+                        used.Append(i)
+                        Dim category As String = String.Trim(descriptor.Category)
+                        If category = "" Then category = "Properties"
+                        grouped.Append(Me.PropertyRow(node, i, descriptor, category, canEdit))
+                        If Not Array.Contains(sections, category) Then sections.Append(category)
+                        Exit For
+                    End If
+                Next
+            Next
+        End If
+        For i As Integer = 0 To Array.Count(Me.mInspectorProperties) - 1
+            If Array.Contains(used, i) Then Continue For
+            If Me.mInspectorProperties(i).Name = "Frame" Then Continue For
+            grouped.Append(Me.PropertyRow(node, i, Nil, "Other", canEdit))
+            If Not Array.Contains(sections, "Other") Then sections.Append("Other")
+        Next
+        For Each section As String In sections
+            rows.Append(Me.SectionRow(section))
+            For Each row As LayoutInspectorRow In grouped
+                If row.Section = section Then rows.Append(row)
+            Next
+        Next
+
+        rows.Append(Me.SectionRow("Arrange"))
+        Me.AppendCommandRow(rows, "Arrange", ["center-horizontally", "center-vertically", "bring-to-front", "bring-forward", "send-backward", "send-to-back"])
+    End Sub
+
+    Private Function ReadOnlyGeometryReason(node As LayoutNode) As String
+        If Me.mHost = Nil Then Return "Read-only: no editing host is attached."
+        If Not node.Editable Then Return "Read-only: constrained or non-literal geometry; edit constraints instead."
+        If Not Me.IsCanvasNode(node) Then Return "Read-only: the parent container has no literal coordinate space."
+        If Not node.HasLiteralFrame Then Return "Read-only: Frame is not a literal (x, y, width, height)."
+        Return "Read-only."
+    End Function
+
+    Private Sub BuildMultiRows(ids As Array Of String, rows As Array Of LayoutInspectorRow)
+        rows.Append(Me.SectionRow("Selection"))
+        Dim info As LayoutInspectorRow = Me.NewRow("info", "selection", "Selected", "Selection")
+        info.Value = String.From(Array.Count(ids)) + " controls"
+        info.Editor = "readonly"
+        info.Detail = "Shift-click adds or removes controls; the first selected control is the key object."
+        rows.Append(info)
+        Dim typeNames As Array Of String = []
+        Dim typeCounts As Array Of Integer = []
+        Dim nodes As Array Of LayoutNode = []
+        For Each id As String In ids
+            Dim node As LayoutNode = Me.mDocument.FindNode(id)
+            nodes.Append(node)
+            Dim at As Integer = -1
+            For t As Integer = 0 To Array.Count(typeNames) - 1
+                If typeNames(t) = node.TypeName Then at = t
+            Next
+            If at < 0 Then
+                typeNames.Append(node.TypeName)
+                typeCounts.Append(1)
+            Else
+                typeCounts(at) = typeCounts(at) + 1
+            End If
+        Next
+        Dim summary As String = ""
+        For i As Integer = 0 To Array.Count(typeNames) - 1
+            If summary <> "" Then summary += ", "
+            summary += typeNames(i)
+            If typeCounts(i) > 1 Then summary += " ×" + String.From(typeCounts(i))
+        Next
+        Dim types As LayoutInspectorRow = Me.NewRow("info", "types", "Types", "Selection")
+        types.Value = summary
+        types.Editor = "readonly"
+        types.Detail = "Key object: " + nodes(0).Name + " (" + nodes(0).TypeName + ")."
+        rows.Append(types)
+
+        rows.Append(Me.SectionRow("Position"))
+        ' Multi-control geometry commits through LayoutRelations.FramesEdits, so it
+        ' is editable exactly when every control passes the arrangement gate.
+        Dim editable As Boolean = Me.mHost <> Nil
+        For Each node As LayoutNode In nodes
+            If Not Me.CanArrangeNode(node) Then editable = False
+        Next
+        Dim labels As Array Of String = ["X", "Y", "Width", "Height"]
+        Dim keys As Array Of String = ["x", "y", "width", "height"]
+        For i As Integer = 0 To 3
+            Dim row As LayoutInspectorRow = Me.NewRow("geometry", keys(i), labels(i), "Position")
+            row.KindName = "integer"
+            Dim first As Integer = LayoutInspectorKit.FrameComponent(nodes(0), i)
+            Dim same As Boolean = True
+            For Each node As LayoutNode In nodes
+                If LayoutInspectorKit.FrameComponent(node, i) <> first Then same = False
+            Next
+            If same Then
+                row.Value = String.From(first)
+                row.EditText = row.Value
+            Else
+                row.Mixed = True
+                row.Value = ""
+                row.EditText = ""
+            End If
+            If editable Then
+                row.Editor = "geometry"
+                row.Detail = "Applies to every selected control in one undoable edit. Up/Down moves each by 1 (Shift: 10)."
+                If i >= 2 Then row.Minimum = Some(1.0)
+            Else
+                row.Editor = "readonly"
+                row.Detail = "Read-only: some selected controls are hidden, constrained, computed or inside an unsupported container."
+            End If
+            rows.Append(row)
+        Next
+
+        rows.Append(Me.SectionRow("Arrange"))
+        Me.AppendCommandRow(rows, "Arrange", ["align-left", "align-hcenter", "align-right", "align-top", "align-vcenter", "align-bottom"])
+        Me.AppendCommandRow(rows, "Arrange", ["distribute-hcenter", "distribute-vcenter", "space-horizontal-equal", "space-vertical-equal", "size-same-width", "size-same-height"])
+        ' Z-order commands act on a single control, so they are not offered here.
+        Me.AppendCommandRow(rows, "Arrange", ["size-same-size"])
+    End Sub
+
+    Private Sub AppendCommandRow(rows As Array Of LayoutInspectorRow, section As String, commands As Array Of String)
+        Dim row As LayoutInspectorRow = Me.NewRow("buttons", "buttons:" + String.From(Array.Count(rows)), section, section)
+        row.Height = 38
+        For Each command As String In commands
+            row.Commands.Append(command)
+            row.CommandEnabled.Append(Me.CanPerformCommand(command))
+            If row.Value <> "" Then row.Value += ", "
+            row.Value += LayoutInspectorKit.InspectorCommandTitle(command)
+        Next
+        rows.Append(row)
+    End Sub
+
+    Private Function FindPropertyDescriptor(node As LayoutNode, name As String) As LayoutPropertyDescriptor
+        Dim control As LayoutControlDescriptor = Me.ResolveDescriptor(node.TypeName)
+        If control = Nil Then Return Nil
+        Dim found As LayoutPropertyDescriptor = Nil
+        For Each prop As LayoutPropertyDescriptor In control.Properties
+            If prop.Name = name Then found = prop
+        Next
+        Return found
+    End Function
+
+    Private Function PropertyRow(node As LayoutNode, index As Integer, descriptor As LayoutPropertyDescriptor, section As String, canEdit As Boolean) As LayoutInspectorRow
+        Dim prop As LayoutProperty = Me.mInspectorProperties(index)
+        Dim label As String = prop.Name
+        If descriptor <> Nil Then label = descriptor.DisplayName
+        Dim row As LayoutInspectorRow = Me.NewRow("property", "prop:" + prop.Name, label, section)
+        row.PropertyIndex = index
+        row.Present = index < Me.mPresentCount
+        Dim mode As String = Me.ClassifyProperty(prop, descriptor, canEdit)
+        Me.DecorateRow(row, mode, prop, descriptor)
+        Return row
+    End Function
+
+    ''' Side-effect-free editor classification (ShowProperty is authoritative for
+    ''' the active row because custom editor allocation can fail or be capped).
+    Private Function ClassifyProperty(prop As LayoutProperty, descriptor As LayoutPropertyDescriptor, canEdit As Boolean) As String
+        If Not prop.Editable Or Not canEdit Then Return "readonly"
+        If descriptor <> Nil Then
+            If descriptor.ReadOnly Or descriptor.ConstructorIndex >= 0 Or descriptor.ConstructorParameter <> "" Then Return "readonly"
+            If descriptor.EditorId <> "" Then
+                Dim factory As LayoutPropertyViewFactory = Me.mCatalog.EditorViewFor(descriptor.EditorId)
+                For Each failed As LayoutPropertyViewFactory In Me.mFailedFactories
+                    If failed = factory Then factory = Nil
+                Next
+                If factory <> Nil Then Return "custom"
+                If Me.AvailablePropertyEditor(descriptor.EditorId) <> Nil Then Return "plugin"
+            End If
+        End If
+        Return LayoutInspectorKit.ClassifyLiteral(prop.RawValue, descriptor)
+    End Function
+
+    ''' Fills display/editor fields of a property row for a classified mode.
+    Private Sub DecorateRow(row As LayoutInspectorRow, mode As String, prop As LayoutProperty, descriptor As LayoutPropertyDescriptor)
+        Dim raw As String = String.Trim(prop.RawValue)
+        row.Value = raw
+        row.EditText = raw
+        row.Options = []
+        row.OptionLabels = []
+        row.Monospace = False
+        row.HasSwatch = False
+        row.Checked = False
+        If descriptor <> Nil Then
+            row.KindName = String.LCase(descriptor.Kind)
+            row.Minimum = descriptor.Minimum
+            row.Maximum = descriptor.Maximum
+            If descriptor.StepValue > 0.0 Then row.StepValue = descriptor.StepValue
+            For Each optionValue As String In descriptor.Options
+                row.Options.Append(optionValue)
+                row.OptionLabels.Append(LayoutInspectorKit.ShortSymbol(optionValue))
+            Next
+        End If
+        Select Case mode
+            Case "string"
+                row.Editor = "text"
+                row.Value = LayoutInspectorKit.DecodeStringLiteral(raw)
+                row.EditText = row.Value
+                If row.KindName = "" Then row.KindName = "string"
+                row.Detail = "Text. Return or leaving the field commits; Escape reverts."
+            Case "integer", "double"
+                row.Editor = "number"
+                If row.KindName = "" Then row.KindName = mode
+                row.Detail = "Number. Up/Down steps by " + LayoutInspectorKit.FormatNumber(row.StepValue) + " (Shift: ×10)" + LayoutInspectorKit.RangeText(row) + "."
+            Case "boolean"
+                row.Editor = "bool"
+                row.Checked = raw = "True"
+                If row.KindName = "" Then row.KindName = "boolean"
+                row.Detail = "Click the box or press Space to toggle."
+            Case "enum"
+                row.Editor = "enum"
+                row.Value = LayoutInspectorKit.ShortSymbol(raw)
+                row.Detail = raw
+            Case "raw"
+                row.Editor = "raw"
+                row.Monospace = True
+                row.KindName = "symbol"
+                row.Detail = "Raw expression; it may be replaced with another qualified symbol."
+            Case "custom"
+                row.Editor = "custom"
+                row.Value = LayoutInspectorKit.DecodeStringLiteral(raw)
+                row.Detail = "Edited with the package's custom editor below."
+            Case "plugin"
+                row.Editor = "plugin"
+                row.Value = LayoutInspectorKit.DecodeStringLiteral(raw)
+                row.Detail = "Click Edit… or press Return to open the package's editor."
+            Case Else
+                row.Editor = "readonly"
+                row.Value = LayoutInspectorKit.DecodeStringLiteral(raw)
+                row.Monospace = Not LayoutInspectorKit.IsSimpleLiteral(raw)
+                row.Detail = Me.ReadOnlyPropertyReason(row, prop, descriptor)
+        End Select
+        Dim swatch As Optional Of Color = LayoutInspectorKit.ParseColorExpression(raw)
+        If swatch.HasValue Then
+            row.HasSwatch = True
+            row.Swatch = swatch.Value
+        End If
+    End Sub
+
+    Private Function ReadOnlyPropertyReason(row As LayoutInspectorRow, prop As LayoutProperty, descriptor As LayoutPropertyDescriptor) As String
+        If Not row.Present Then Return "Not set in source; showing the descriptor default. Assign it in source to override."
+        If Me.mHost = Nil Then Return "Read-only: no editing host is attached."
+        If Not prop.Editable Then Return "Read-only: this assignment cannot be edited safely in place."
+        Dim node As LayoutNode = Me.CurrentNode()
+        If node <> Nil Then
+            If Not Me.IsCanvasNode(node) Then Return "Read-only: the control is outside the editable layout region."
+        End If
+        If descriptor <> Nil Then
+            If descriptor.ReadOnly Then Return "Read-only property."
+            If descriptor.ConstructorIndex >= 0 Or descriptor.ConstructorParameter <> "" Then Return "Constructor argument; fixed when the control is created."
+            If Array.Count(descriptor.Options) > 0 Then Return "Expression is not one of the known options; edit it in source."
+        End If
+        Return "Expression; the inspector preserves it verbatim. Edit it in source."
+    End Function
+
+    Private Sub ApplyRowFilter()
+        Dim filter As String = String.LCase(String.Trim(Me.mFilterText))
+        Dim visible As Array Of LayoutInspectorRow = []
+        Dim pending As LayoutInspectorRow = Nil
+        For Each row As LayoutInspectorRow In Me.mAllRows
+            If row.Kind = "section" Then
+                row.Count = 0
+                For Each other As LayoutInspectorRow In Me.mAllRows
+                    If other.Kind <> "section" And other.Section = row.Label Then row.Count += 1
+                Next
+                If filter = "" Then
+                    visible.Append(row)
+                    pending = Nil
+                Else
+                    pending = row
+                End If
+                Continue For
+            End If
+            If filter <> "" And row.Kind <> "message" Then
+                Dim matches As Boolean = String.Contains(row.Label, filter) Or String.Contains(row.Value, filter) Or String.Contains(row.Section, filter) Or String.Contains(row.KindName, filter)
+                If Not matches Then Continue For
+                If pending <> Nil Then
+                    visible.Append(pending)
+                    pending = Nil
+                End If
+            ElseIf Array.Contains(Me.mCollapsedSections, row.Section) Then
+                Continue For
+            End If
+            visible.Append(row)
+        Next
+        If Array.Count(visible) = 0 And filter <> "" Then visible.Append(Me.MessageRow("No properties match “" + String.Trim(Me.mFilterText) + "”."))
+        Me.mRows = visible
+    End Sub
+
+    Private Function FindInspectorRow(key As String) As LayoutInspectorRow
+        If key = "" Then Return Nil
+        For Each row As LayoutInspectorRow In Me.mAllRows
+            If LayoutInspectorKit.SameText(row.Key, key) Then Return row
+        Next
+        Return Nil
+    End Function
+
+    Private Function VisibleRowIndex(key As String) As Integer
+        For i As Integer = 0 To Array.Count(Me.mRows) - 1
+            If LayoutInspectorKit.SameText(Me.mRows(i).Key, key) Then Return i
+        Next
+        Return -1
+    End Function
+
+    Private Function PrimaryPropertyKeyFor() As String
+        If Array.Count(Me.InspectorSelection()) > 1 Then Return "x"
+        If Me.CurrentNode() = Nil Then Return ""
+        ' Rows are rebuilt for the Properties mode before choosing.
+        Return "*primary"
+    End Function
+
+    Private Function PrimaryRowKey() As String
+        Dim names As Array Of String = ["Caption", "Text", "Title", "Label", "Value", "Placeholder"]
+        For pass As Integer = 0 To 1
+            For Each name As String In names
+                Dim row As LayoutInspectorRow = Me.FindInspectorRow("prop:" + name)
+                If row = Nil Then Continue For
+                If pass = 1 Or (row.Editor <> "readonly" And row.Present) Then Return row.Key
+            Next
+        Next
+        Return "name"
+    End Function
+
+    ''' Reveals the inspector in Properties mode, activates key and focuses its editor.
+    Private Function FocusInspectorRow(key As String) As Boolean
+        If key = "" Then Return False
+        If Me.mInspectorCollapsed Then
+            Me.mInspectorCollapsed = False
+            Me.RelayoutPanel()
+        End If
+        If Me.mMode <> "properties" Then Me.InspectorMode = "properties"
+        If Me.mFilterText <> "" Then Me.InspectorFilter = ""
+        If key = "*primary" Then key = Me.PrimaryRowKey()
+        Dim row As LayoutInspectorRow = Me.FindInspectorRow(key)
+        If row = Nil Then Return False
+        If Array.Contains(Me.mCollapsedSections, row.Section) Then Me.ToggleInspectorSection(row.Section)
+        If Not Me.ActivateInspectorRow(key) Then Return False
+        If Me.mValueField.Visible Then
+            ' Native focus selects the whole value on GTK and AppKit.
+            Me.mValueField.Focus()
+            Return True
+        End If
+        If Me.mValuePopup.Visible Then
+            Me.mValuePopup.Focus()
+            Return True
+        End If
+        Me.mInspectorGrid.Focus()
+        Return False
+    End Function
+
+    ' ------------------------------------------------------------------
+    ' Active property (legacy semantics for custom/plugin editors)
+    ' ------------------------------------------------------------------
+
+    Public Sub ShowProperty(index As Integer)
+        Me.mShowDepth += 1
+        Try
+            Me.ShowPropertyCore(index)
+        Finally
+            Me.mShowDepth -= 1
+        End Try
+        Me.SyncActivePropertyRow()
+        Me.InspectorRowsChanged()
+    End Sub
+
+    Private Sub ShowPropertyCore(index As Integer)
+        Me.ExpireBindings()
+        Me.mPropertyDetail = ""
+        Me.mPropertyMode = "readonly"
+        Me.mProperty = Nil
+        Me.mDescriptor = Nil
+        Dim node As LayoutNode = Me.CurrentNode()
+        If node = Nil Then Return
+        Dim properties As Array Of LayoutProperty = Me.mInspectorProperties
+        If index < 0 Or index >= Array.Count(properties) Then Return
+        Me.mProperty = properties(index)
+        Me.mActiveKey = "prop:" + Me.mProperty.Name
+        Me.mDescriptor = Me.FindPropertyDescriptor(node, Me.mProperty.Name)
+        If Not Me.mProperty.Editable Or Me.mHost = Nil Or Not Me.IsCanvasNode(node) Then Return
+        If Me.mDescriptor <> Nil Then
+            If Me.mDescriptor.ReadOnly Or Me.mDescriptor.ConstructorIndex >= 0 Or Me.mDescriptor.ConstructorParameter <> "" Then Return
+            If Me.mDescriptor.EditorId <> "" Then
+                Dim factory As LayoutPropertyViewFactory = Me.mCatalog.EditorViewFor(Me.mDescriptor.EditorId)
+                For Each failed As LayoutPropertyViewFactory In Me.mFailedFactories
+                    If failed = factory Then factory = Nil
+                Next
+                Dim reusableView As View
+                If factory <> Nil Then
+                    For i As Integer = 0 To Me.CustomViewCount - 1
+                        If Me.mCustomFactories(i) = factory Then
+                            If TryCast(Me.mCustomViews(i), LayoutReusablePropertyViewV1) <> Nil Then
+                                reusableView = Me.mCustomViews(i)
+                                Exit For
+                            End If
+                        End If
+                    Next
+                End If
+                If factory <> Nil And (reusableView <> Nil Or Me.mCustomAllocations < 16) Then
+                    Dim binding As New LayoutPropertyBinding()
+                    binding.Owner = Me
+                    binding.NodeId = node.Id
+                    binding.PropertyName = Me.mProperty.Name
+                    binding.Version = Me.mDocument.Version
+                    binding.Generation = Me.mGeneration
+                    binding.Snapshot = Me.mDocument
+                    Dim expectedGeneration As Integer = Me.mGeneration
+                    Dim expectedSnapshot As LayoutDocument = Me.mDocument
+                    Dim custom As View = reusableView
+                    ' Track the binding BEFORE plugin code so reentrant reloads expire it.
+                    Me.mBindings.Append(binding)
+                    Try
+                        If custom <> Nil Then
+                            Dim reusable As LayoutReusablePropertyViewV1 = TryCast(custom, LayoutReusablePropertyViewV1)
+                            reusable.RebindProperty(Me.mProperty.RawValue, binding)
+                        Else
+                            ' Reserve before calling plugin code, including failed/reentrant calls.
+                            Me.mCustomAllocations += 1
+                            custom = factory.CreateView(Me.mProperty.RawValue, binding)
+                            If custom <> Nil Then
+                                Me.mCustomViews.Append(custom)
+                                Me.mCustomFactories.Append(factory)
+                                custom.Visible = False
+                                custom.Enabled = False
+                                Me.mInspector.AddSubview(custom)
+                            End If
+                        End If
+                    Catch e As Exception
+                        binding.Owner = Nil
+                        binding.Snapshot = Nil
+                        custom = Nil
+                        Me.mFailedFactories.Append(factory)
+                        Me.Status("Custom editor failed; use generic literal editor.")
+                    End Try
+                    ' A failed binding expires independently of the selection. Only a
+                    ' reentrant selection/reload prevents fallback for this inspector.
+                    If expectedGeneration <> Me.mGeneration Or expectedSnapshot <> Me.mDocument Then
+                        binding.Owner = Nil
+                        binding.Snapshot = Nil
+                        Return
+                    End If
+                    If custom <> Nil Then
+                        custom.Visible = True
+                        custom.Enabled = True
+                        Me.mActiveCustom = custom
+                        Me.mPropertyMode = "custom"
+                        Return
+                    End If
+                    binding.Owner = Nil
+                End If
+                Dim editor As LayoutPropertyEditor = Me.AvailablePropertyEditor(Me.mDescriptor.EditorId)
+                If editor <> Nil Then
+                    Me.mPropertyMode = "plugin"
+                    Return
+                End If
+            End If
+        End If
+        Me.mPropertyMode = LayoutInspectorKit.ClassifyLiteral(Me.mProperty.RawValue, Me.mDescriptor)
+        If Me.mPropertyMode <> "readonly" And Me.mCustomAllocations >= 16 And Me.mDescriptor <> Nil Then
+            If Me.mDescriptor.EditorId <> "" Then Me.mPropertyDetail = "Custom view limit (16) reached; using the generic literal editor."
+        End If
+    End Sub
+
+    ''' The active row mirrors ShowProperty's authoritative mode (custom editors can
+    ''' fail or be capped and fall back to literal editors).
+    Private Sub SyncActivePropertyRow()
+        If Me.mProperty = Nil Then Return
+        Dim row As LayoutInspectorRow = Me.FindInspectorRow("prop:" + Me.mProperty.Name)
+        If row = Nil Then Return
+        If row.Editor = "readonly" And Me.mPropertyMode = "readonly" Then Return
+        Me.DecorateRow(row, Me.mPropertyMode, Me.mProperty, Me.mDescriptor)
+        If Me.mPropertyDetail <> "" Then row.Detail = Me.mPropertyDetail
+    End Sub
+
+    Public Function BoundPropertyIsCurrent(nodeId As String, propertyName As String, version As Integer, generation As Integer, snapshot As LayoutDocument) As Boolean
+        If Me.mDocument = Nil Or Me.mHost = Nil Then Return False
+        If snapshot <> Me.mDocument Then Return False
+        If generation <> Me.mGeneration Or version <> Me.mDocument.Version Or nodeId <> Me.mSelected Then Return False
+        If Me.mProperty = Nil Then Return False
+        If Me.mProperty.Name <> propertyName Or Not Me.mProperty.Editable Then Return False
+        Return True
+    End Function
+
+    Public Function CommitBoundProperty(nodeId As String, propertyName As String, version As Integer, generation As Integer, snapshot As LayoutDocument, expression As String) As Boolean
+        If Not Me.BoundPropertyIsCurrent(nodeId, propertyName, version, generation, snapshot) Then Return False
+        ' Keep a floating source literal floating when a numeric editor submits 1.
+        ' The document model remains strict about preserving the original kind.
+        If Not Integer.Parse(Me.mProperty.RawValue).IsOk And Double.Parse(Me.mProperty.RawValue).IsOk Then
+            If Integer.Parse(String.Trim(expression)).IsOk Then expression = String.Trim(expression) + ".0"
+        End If
+        If Me.mDescriptor <> Nil Then
+            If Me.mDescriptor.ConstructorIndex >= 0 Or Me.mDescriptor.ConstructorParameter <> "" Then Return False
+            If Not Me.mDescriptor.ValidateExpression(expression) Then
+                Me.Status("Expression does not match the property descriptor.")
+                Return False
+            End If
+        End If
+        Try
+            Dim edits As Array Of EditorEdit = Me.mDocument.PropertyEdits(nodeId, propertyName, expression)
+            Return Me.Submit(version, edits)
+        Catch e As InvalidArgumentException
+            Me.Status(e.Message)
+            Return False
+        End Try
+    End Function
+
+    Private Function AvailablePropertyEditor(id As String) As LayoutPropertyEditor
+        Dim editor As LayoutPropertyEditor = Me.mCatalog.EditorFor(id)
+        For Each failed As LayoutPropertyEditor In Me.mFailedEditors
+            If failed = editor Then Return Nil
+        Next
+        Return editor
+    End Function
+
+    ''' Commits the active property's editor; opens the registered editor for
+    ''' plugin-backed properties.
+    Public Sub ApplyPropertyField()
+        If Me.mProperty = Nil Or Me.mDocument = Nil Or Me.mHost = Nil Then Return
+        If Me.mPropertyMode = "plugin" Then
+            Dim editor As LayoutPropertyEditor = Me.AvailablePropertyEditor(Me.mDescriptor.EditorId)
+            If editor = Nil Then Return
+            Dim generation As Integer = Me.mGeneration
+            Dim snapshot As LayoutDocument = Me.mDocument
+            Dim propertyName As String = Me.mProperty.Name
+            Dim edited As Optional Of String
+            Try
+                edited = editor.EditExpression(Me.mProperty.RawValue)
+            Catch e As Exception
+                Me.mFailedEditors.Append(editor)
+                ' Plugin code may synchronously change selection or reload. Never
+                ' replace that newer inspector with the failed invocation's row.
+                If generation <> Me.mGeneration Or snapshot <> Me.mDocument Then Return
+                Me.RefreshInspector()
+                Me.SelectProperty(propertyName)
+                Me.Status("Property editor failed; using the generic literal editor: " + e.Message)
+                Return
+            End Try
+            If generation <> Me.mGeneration Or snapshot <> Me.mDocument Or Not edited.HasValue Then Return
+            Me.CommitBoundProperty(Me.mSelected, Me.mProperty.Name, Me.mDocument.Version, Me.mGeneration, Me.mDocument, edited.Value)
+            Return
+        End If
+        Dim key As String = "prop:" + Me.mProperty.Name
+        If Me.mValueField.Visible And LayoutInspectorKit.SameText(Me.mEditKey, key) Then Me.CommitInspectorText(key, Me.mValueField.Text)
+    End Sub
+
+    ' ------------------------------------------------------------------
+    ' Commits
+    ' ------------------------------------------------------------------
+
+    Private Function CommitInspectorText(key As String, text As String) As Boolean
+        Dim row As LayoutInspectorRow = Me.FindInspectorRow(key)
+        If row = Nil Or Me.mDocument = Nil Then Return False
+        If Me.mHost = Nil Then
+            Me.Status("No editing host is attached.")
+            Return False
+        End If
+        Select Case row.Editor
+            Case "name"
+                Dim name As String = String.Trim(text)
+                If name = "" Then
+                    Me.Status("Enter a new name.")
+                    Return False
+                End If
+                If LayoutInspectorKit.SameText(name, row.Value) Then Return True
+                Return Me.RenameSelected(name)
+            Case "geometry"
+                Return Me.CommitGeometry(row.Key, text, 0)
+            Case "readonly", "none", "custom"
+                Me.Status(row.Label + " is read-only here.")
+                Return False
+        End Select
+        If row.Kind <> "property" Then Return False
+        Dim propertyName As String = String.Substring(row.Key, 5)
+        Dim bound As Boolean = False
+        If Me.mProperty <> Nil Then bound = LayoutInspectorKit.SameText(Me.mProperty.Name, propertyName)
+        If Not bound Then
+            If Not Me.SelectPropertyQuiet(propertyName) Then Return False
+        End If
+        If Me.mProperty = Nil Then Return False
+        Dim expression As String = String.Trim(text)
+        Select Case Me.mPropertyMode
+            Case "string"
+                expression = LayoutInspectorKit.QuoteBuoyString(text)
+            Case "integer"
+                If Not Integer.Parse(expression).IsOk Then
+                    Me.Status(row.Label + " requires a whole number.")
+                    Return False
+                End If
+            Case "double"
+                If Not Double.Parse(expression).IsOk Then
+                    Me.Status(row.Label + " requires a number.")
+                    Return False
+                End If
+            Case "boolean"
+                Dim lower As String = String.LCase(expression)
+                If lower = "true" Or lower = "1" Or lower = "on" Or lower = "yes" Then
+                    expression = "True"
+                ElseIf lower = "false" Or lower = "0" Or lower = "off" Or lower = "no" Then
+                    expression = "False"
+                Else
+                    Me.Status(row.Label + " must be True or False.")
+                    Return False
+                End If
+            Case "enum"
+                Dim chosen As String = ""
+                If Me.mDescriptor <> Nil Then
+                    For Each optionValue As String In Me.mDescriptor.Options
+                        If LayoutInspectorKit.SameText(optionValue, expression) Then chosen = optionValue
+                    Next
+                    If chosen = "" Then
+                        For Each optionValue As String In Me.mDescriptor.Options
+                            If String.Compare(LayoutInspectorKit.ShortSymbol(optionValue), expression) = 0 Then chosen = optionValue
+                        Next
+                    End If
+                End If
+                If chosen = "" Then
+                    Me.Status(row.Label + " must be one of the listed options.")
+                    Return False
+                End If
+                expression = chosen
+            Case "raw"
+                If Not LayoutInspectorKit.IsQualifiedSymbol(expression) Then
+                    Me.Status("Only a qualified symbol (for example Color.Red) can replace this expression here.")
+                    Return False
+                End If
+            Case "plugin"
+                Me.ApplyPropertyField()
+                Return True
+            Case Else
+                Me.Status(row.Label + " is read-only here.")
+                Return False
+        End Select
+        If LayoutInspectorKit.SameText(expression, Me.mProperty.RawValue) Then Return True
+        Return Me.CommitBoundProperty(Me.mSelected, Me.mProperty.Name, Me.mDocument.Version, Me.mGeneration, Me.mDocument, expression)
+    End Function
+
+    ''' Writes one frame component for every selected control in one transaction.
+    ''' delta <> 0 moves each control relative to its own value (mixed selections).
+    Private Function CommitGeometry(key As String, text As String, delta As Integer) As Boolean
+        Dim component As Integer = -1
+        Dim names As Array Of String = ["x", "y", "width", "height"]
+        For i As Integer = 0 To 3
+            If LayoutInspectorKit.SameText(names(i), key) Then component = i
+        Next
+        If component < 0 Or Me.mDocument = Nil Then Return False
+        ' Commit a pending keyboard nudge first; the frames below are then built
+        ' from the reloaded document and selection instead of pre-nudge values.
+        Me.FlushNudge()
+        If Me.mDocument = Nil Then Return False
+        Dim ids As Array Of String = Me.InspectorSelection()
+        If Array.Count(ids) = 0 Then Return False
+        Dim absolute As Integer = 0
+        If delta = 0 Then
+            Dim parsed As Result Of Integer, String = Integer.Parse(String.Trim(text))
+            If parsed.IsErr Then
+                Me.Status("Frame values must be whole numbers.")
+                Return False
+            End If
+            absolute = parsed.Value
+        End If
+        Dim frames As JSONItem = JSONItem.NewArray()
+        Dim lastFrame As Array Of Integer = []
+        Dim changed As Boolean = False
+        For Each id As String In ids
+            Dim node As LayoutNode = Me.mDocument.FindNode(id)
+            Dim values As Array Of Integer = [node.X, node.Y, node.Width, node.Height]
+            Dim nextValue As Integer = absolute
+            If delta <> 0 Then nextValue = values(component) + delta
+            If component >= 2 And nextValue < 1 Then
+                If delta = 0 Then
+                    Me.Status("Width and height must be positive.")
+                    Return False
+                End If
+                nextValue = 1
+            End If
+            If values(component) <> nextValue Then changed = True
+            values(component) = nextValue
+            Dim frame As JSONItem = JSONItem.NewObject()
+            frame.Value("x") = values(0) + 0.0
+            frame.Value("y") = values(1) + 0.0
+            frame.Value("width") = values(2) + 0.0
+            frame.Value("height") = values(3) + 0.0
+            frames.Add(frame)
+            lastFrame = values
+        Next
+        If Not changed Then Return True
+        Try
+            If Array.Count(ids) = 1 Then Return Me.ApplyFrame(lastFrame(0), lastFrame(1), lastFrame(2), lastFrame(3))
+            Dim edits As Array Of EditorEdit = LayoutRelations.FramesEdits(Me.mDocument, ids, frames)
+            Return Me.Submit(Me.mDocument.Version, edits)
+        Catch e As InvalidArgumentException
+            Me.Status(e.Message)
+            Return False
+        End Try
+    End Function
+
+    Private Function StepInspectorValue(key As String, steps As Integer) As Boolean
+        Dim row As LayoutInspectorRow = Me.FindInspectorRow(key)
+        If row = Nil Or steps = 0 Then Return False
+        Dim editing As Boolean = Me.mValueField.Visible And LayoutInspectorKit.SameText(Me.mEditKey, row.Key)
+        If row.Editor = "geometry" Then
+            ' Relative steps read the current frame inside CommitGeometry (after any
+            ' pending nudge is committed); only text being typed is used as-is.
+            If editing And Not row.Mixed And Array.Count(Me.InspectorSelection()) = 1 Then
+                Dim typedText As String = String.Trim(Me.mValueField.Text)
+                If typedText <> String.Trim(row.EditText) Then
+                    Dim typed As Result Of Integer, String = Integer.Parse(typedText)
+                    If typed.IsOk Then Return Me.CommitGeometry(row.Key, String.From(typed.Value + steps), 0)
+                End If
+            End If
+            Return Me.CommitGeometry(row.Key, "", steps)
+        End If
+        If row.Editor <> "number" Then Return False
+        Dim value As Double = Double.Parse(String.Trim(row.EditText)).Or(0.0)
+        If editing Then value = Double.Parse(String.Trim(Me.mValueField.Text)).Or(value)
+        value += steps * row.StepValue
+        If row.Minimum.HasValue Then value = Math.Max(value, row.Minimum.Value)
+        If row.Maximum.HasValue Then value = Math.Min(value, row.Maximum.Value)
+        Dim formatted As String = LayoutInspectorKit.FormatNumber(value)
+        If Integer.Parse(String.Trim(row.EditText)).IsOk Then formatted = String.From(Math.Round(value))
+        Return Me.CommitInspectorText(row.Key, formatted)
+    End Function
+
+    Private Function ToggleBooleanRow(key As String) As Boolean
+        Dim row As LayoutInspectorRow = Me.FindInspectorRow(key)
+        If row = Nil Then Return False
+        If row.Editor <> "bool" Then Return False
+        If Not LayoutInspectorKit.SameText(row.Key, Me.mActiveKey) Then Me.ActivateInspectorRow(row.Key)
+        Dim nextValue As String = "True"
+        If row.Checked Then nextValue = "False"
+        Return Me.CommitInspectorText(row.Key, nextValue)
+    End Function
+
+    Private Sub RunInspectorCommand(command As String)
+        If Me.CanPerformCommand(command) Then
+            Me.PerformCommand(command)
+        Else
+            Me.Status(LayoutInspectorKit.InspectorCommandTitle(command) + " is not available for this selection.")
+        End If
+    End Sub
+
+    ' ------------------------------------------------------------------
+    ' Editor overlay binding
+    ' ------------------------------------------------------------------
+
+    ''' Rows or the active row changed: rebind the overlay editor and repaint.
+    Private Sub InspectorRowsChanged()
+        Me.BindInspectorEditor()
+        Me.LayoutInspectorBody()
+        Me.UpdateInspectorAccessibility()
+        Me.mInspectorGrid.Invalidate()
+        Me.mInspectorDetail.Invalidate()
+        Me.mInspectorBackdrop.Invalidate()
+    End Sub
+
+    Private Sub UpdateInspectorAccessibility()
+        Dim modeLabel As String = "Inspector mode: Properties"
+        If Me.mMode = "constraints" Then modeLabel = "Inspector mode: Constraints"
+        If Me.mInspectorBackdrop.AccessibleLabel <> modeLabel Then
+            Me.mInspectorBackdrop.AccessibleLabel = modeLabel
+            Me.mInspectorBackdrop.NotifyAccessibilityChanged()
+        End If
+        Dim label As String = "Properties inspector"
+        If Me.mMode = "constraints" Then label = "Constraints inspector"
+        Dim row As LayoutInspectorRow = Me.FindInspectorRow(Me.mActiveKey)
+        If row <> Nil Then
+            label += ": " + row.Label
+            If row.Value <> "" Then label += ", " + row.Value
+            Me.mValueField.AccessibleLabel = row.Label
+            Me.mValuePopup.AccessibleLabel = row.Label
+        End If
+        If Me.mInspectorGrid.AccessibleLabel <> label Then
+            Me.mInspectorGrid.AccessibleLabel = label
+            Me.mInspectorGrid.NotifyAccessibilityChanged()
+        End If
+    End Sub
+
+    ''' Keyboard equivalent of the inspector's Properties/Constraints mode switch.
+    Public Function InspectorModeKey(key As KeyName) As Boolean
+        Select Case key
+            Case KeyName.Left, KeyName.Home
+                Me.InspectorMode = "properties"
+            Case KeyName.Right, KeyName.EndKey
+                Me.InspectorMode = "constraints"
+            Case KeyName.Space
+                If Me.mMode = "properties" Then
+                    Me.InspectorMode = "constraints"
+                Else
+                    Me.InspectorMode = "properties"
+                End If
+            Case KeyName.Return
+                Me.mInspectorGrid.Focus()
+            Case Else
+                Return False
+        End Select
+        Return True
+    End Function
+
+    Private Function RowHasOverlay(row As LayoutInspectorRow) As Boolean
+        If row.Kind = "cfield" Then Return True
+        If Not LayoutInspectorKit.SameText(row.Key, Me.mActiveKey) Or Me.mMode = "constraints" Then Return False
+        Select Case row.Editor
+            Case "name", "geometry", "text", "number", "raw", "enum"
+                Return True
+        End Select
+        Return False
+    End Function
+
+    Private Function RowHeightOf(row As LayoutInspectorRow) As Integer
+        If Me.RowHasOverlay(row) Then Return Math.Max(row.Height, Me.InspectorControlHeight() + 4)
+        Return row.Height
+    End Function
+
+    Private Sub BindInspectorEditor()
+        Dim row As LayoutInspectorRow = Me.FindInspectorRow(Me.mActiveKey)
+        Dim wantsField As Boolean = False
+        Dim wantsPopup As Boolean = False
+        If row <> Nil Then
+            If Me.RowHasOverlay(row) And row.Kind <> "cfield" Then
+                wantsPopup = row.Editor = "enum"
+                wantsField = Not wantsPopup
+            End If
+        End If
+        Dim nodes As String = String.Join(Me.InspectorSelection(), ",")
+        Dim version As Integer = -1
+        If Me.mDocument <> Nil Then version = Me.mDocument.Version
+        Me.mEditBinding = True
+        Try
+            If wantsField Then
+                Dim text As String = row.EditText
+                If row.Mixed Then text = ""
+                Dim stale As Boolean = Not LayoutInspectorKit.SameText(Me.mEditKey, row.Key) Or String.Compare(Me.mEditOriginal, text, True) <> 0 Or Me.mEditVersion <> version Or Me.mEditNodes <> nodes Or Not Me.mValueField.Visible
+                If stale Then
+                    Me.mValueField.Text = text
+                    Me.mEditOriginal = text
+                End If
+                If row.Mixed Then
+                    Me.mValueField.Placeholder = "Mixed"
+                Else
+                    Me.mValueField.Placeholder = ""
+                End If
+                If row.Monospace Then
+                    Me.mValueField.FontName = LayoutInspectorKit.InspectorMonoFont()
+                Else
+                    Me.mValueField.FontName = ""
+                End If
+                Me.mEditKey = row.Key
+            ElseIf wantsPopup Then
+                Me.mValuePopup.RemoveAllItems()
+                Dim selected As Integer = -1
+                For i As Integer = 0 To Array.Count(row.Options) - 1
+                    Me.mValuePopup.AddItem(row.OptionLabels(i))
+                    If String.Compare(row.Options(i), row.EditText, True) = 0 Then selected = i
+                Next
+                Me.mValuePopup.SelectedIndex = selected
+                Me.mEditKey = row.Key
+                Me.mEditOriginal = row.EditText
+            Else
+                Me.mEditKey = ""
+                Me.mEditOriginal = ""
+            End If
+            Me.mEditVersion = version
+            Me.mEditNodes = nodes
+        Finally
+            Me.mEditBinding = False
+        End Try
+        Me.mValueField.Visible = wantsField
+        Me.mValuePopup.Visible = wantsPopup
+    End Sub
+
+    ''' Commits the overlay editor when its text differs from the bound value.
+    Private Sub CommitValueField(fromFocusLoss As Boolean)
+        If Me.mInspectorBusy Or Me.mEditBinding Or Me.mEditKey = "" Then Return
+        If Not Me.mValueField.Visible Then Return
+        Dim text As String = Me.mValueField.Text
+        Dim original As String = Me.mEditOriginal
+        If String.Compare(text, original, True) = 0 Then Return
+        If Me.mDocument = Nil Then Return
+        If Me.mDocument.Version <> Me.mEditVersion Or String.Join(Me.InspectorSelection(), ",") <> Me.mEditNodes Then Return
+        Dim key As String = Me.mEditKey
+        Me.mEditOriginal = text
+        Dim committed As Boolean = False
+        Me.mInspectorBusy = True
+        Try
+            committed = Me.CommitInspectorText(key, text)
+        Finally
+            Me.mInspectorBusy = False
+        End Try
+        If Not committed And LayoutInspectorKit.SameText(Me.mEditKey, key) Then
+            Me.mEditOriginal = original
+            If fromFocusLoss Then
+                Me.mEditBinding = True
+                Me.mValueField.Text = original
+                Me.mEditBinding = False
+            End If
+        End If
+    End Sub
+
+    Public Function InspectorFieldKey(purpose As String, key As KeyName, shift As Boolean) As Boolean
+        Select Case purpose
+            Case "filter"
+                If key = KeyName.Escape Then
+                    Me.InspectorFilter = ""
+                    Return True
+                End If
+                If key = KeyName.Down Or key = KeyName.Return Then
+                    Me.mInspectorGrid.Focus()
+                    Me.mActiveKey = ""
+                    Me.MoveActiveRow(1)
+                    Return True
+                End If
+            Case "offset"
+                If key = KeyName.Return Then
+                    Me.ApplyConstraintFromFields()
+                    Return True
+                End If
+            Case "value"
+                Dim row As LayoutInspectorRow = Me.FindInspectorRow(Me.mEditKey)
+                If row = Nil Then Return False
+                Select Case key
+                    Case KeyName.Return
+                        Me.CommitValueField(False)
+                        Return True
+                    Case KeyName.Escape
+                        Me.mEditBinding = True
+                        Me.mValueField.Text = Me.mEditOriginal
+                        Me.mEditBinding = False
+                        Me.mInspectorGrid.Focus()
+                        Return True
+                    Case KeyName.Up, KeyName.Down
+                        Dim direction As Integer = 1
+                        If key = KeyName.Down Then direction = -1
+                        If row.Editor = "number" Or row.Editor = "geometry" Then
+                            If shift Then direction *= 10
+                            Me.CommitValueField(False)
+                            Me.StepInspectorValue(row.Key, direction)
+                            Return True
+                        End If
+                        Me.CommitValueField(False)
+                        Me.mInspectorGrid.Focus()
+                        Me.MoveActiveRow(-direction)
+                        Return True
+                End Select
+        End Select
+        Return False
+    End Function
+
+    Public Sub InspectorFieldFinished(purpose As String)
+        If purpose = "value" Then Me.CommitValueField(True)
+    End Sub
+
+    Public Sub InspectorFieldChanged(purpose As String)
+        If purpose <> "filter" Then Return
+        Dim text As String = Me.mInspectorFilter.Text
+        If String.Compare(text, Me.mFilterText, True) = 0 Then Return
+        Me.mFilterText = text
+        Me.mInspectorScroll = 0
+        Me.ApplyRowFilter()
+        Me.InspectorRowsChanged()
+    End Sub
+
+    Public Sub InspectorPopupChanged(purpose As String)
+        If purpose <> "value" Or Me.mEditBinding Or Me.mInspectorBusy Then Return
+        Dim row As LayoutInspectorRow = Me.FindInspectorRow(Me.mEditKey)
+        If row = Nil Then Return
+        Dim index As Integer = Me.mValuePopup.SelectedIndex
+        If index < 0 Or index >= Array.Count(row.Options) Then Return
+        If String.Compare(row.Options(index), row.EditText, True) = 0 Then Return
+        Dim accepted As Boolean = False
+        Me.mInspectorBusy = True
+        Try
+            accepted = Me.CommitInspectorText(row.Key, row.Options(index))
+        Finally
+            Me.mInspectorBusy = False
+        End Try
+        If Not accepted And LayoutInspectorKit.SameText(Me.mEditKey, row.Key) Then
+            ' Show the source value again after a rejected choice.
+            Me.mEditBinding = True
+            Me.mValuePopup.SelectedIndex = LayoutInspectorKit.IndexOfText(row.Options, row.EditText)
+            Me.mEditBinding = False
+        End If
+    End Sub
+
+    ' ------------------------------------------------------------------
+    ' Grid interaction
+    ' ------------------------------------------------------------------
+
+    Private Function InspectorContentHeight() As Integer
+        Dim total As Integer = 0
+        For Each row As LayoutInspectorRow In Me.mRows
+            total += Me.RowHeightOf(row)
+        Next
+        Return total
+    End Function
+
+    Private Function RowTop(index As Integer) As Integer
+        Dim y As Integer = 0
+        For i As Integer = 0 To index - 1
+            y += Me.RowHeightOf(Me.mRows(i))
+        Next
+        Return y
+    End Function
+
+    Private Function RowAt(y As Double) As Integer
+        Dim top As Double = -Me.mInspectorScroll
+        For i As Integer = 0 To Array.Count(Me.mRows) - 1
+            Dim h As Integer = Me.RowHeightOf(Me.mRows(i))
+            If y >= top And y < top + h Then Return i
+            top += h
+        Next
+        Return -1
+    End Function
+
+    Public Property InspectorScrollOffset As Integer
+        Get
+            Return Me.mInspectorScroll
+        End Get
+    End Property
+
+    Public Function InspectorWheel(dx As Double, dy As Double, pixels As Boolean) As Boolean
+        If Not (dx >= -10000000.0 And dx <= 10000000.0 And dy >= -10000000.0 And dy <= 10000000.0) Then Return False
+        If Me.mInspectorCollapsed Or Me.mScrollDrag Or dy = 0.0 Then Return False
+        Dim delta As Double = dy
+        If Not pixels Then delta *= 72.0
+        Dim before As Integer = Me.mInspectorScroll
+        Dim maximum As Integer = Math.Max(0, Me.InspectorContentHeight() - Me.mGridHeight)
+        If (before = 0 And delta < 0.0) Or (before = maximum And delta > 0.0) Then
+            Me.mInspectorWheelRemainder = 0.0
+            Return False
+        End If
+        Me.mInspectorWheelRemainder += delta
+        Dim whole As Integer = Math.Floor(Math.Abs(Me.mInspectorWheelRemainder))
+        If Me.mInspectorWheelRemainder < 0.0 Then whole = -whole
+        Me.mInspectorWheelRemainder -= whole
+        Me.mInspectorScroll += whole
+        Me.ClampInspectorScroll()
+        If (Me.mInspectorScroll = 0 And whole < 0) Or (Me.mInspectorScroll = maximum And whole > 0) Then Me.mInspectorWheelRemainder = 0.0
+        If Me.mInspectorScroll <> before Then
+            Me.mHoverKey = ""
+            Me.mHoverButton = -1
+            Me.PositionInspectorOverlays()
+            Me.mInspectorGrid.Invalidate()
+        End If
+        Return True
+    End Function
+
+    Private Sub ClampInspectorScroll()
+        Dim maximum As Integer = Math.Max(0, Me.InspectorContentHeight() - Me.mGridHeight)
+        Me.mInspectorScroll = Math.Max(0, Math.Min(Me.mInspectorScroll, maximum))
+    End Sub
+
+    Private Sub RevealInspectorRow(key As String)
+        Dim index As Integer = Me.VisibleRowIndex(key)
+        If index < 0 Then Return
+        Dim top As Integer = Me.RowTop(index)
+        Dim bottom As Integer = top + Me.RowHeightOf(Me.mRows(index))
+        If top < Me.mInspectorScroll Then Me.mInspectorScroll = top
+        If bottom > Me.mInspectorScroll + Me.mGridHeight Then Me.mInspectorScroll = bottom - Me.mGridHeight
+        Me.ClampInspectorScroll()
+        Me.PositionInspectorOverlays()
+        Me.mInspectorGrid.Invalidate()
+    End Sub
+
+    Private Function InspectorLabelWidth() As Integer
+        If Me.mMode = "constraints" Then Return Math.Max(84, Math.Min(124, Me.mInspectorW * 34 \ 100))
+        Return Math.Max(84, Math.Min(160, Me.mInspectorW * 40 \ 100))
+    End Function
+
+    Private Function ScrollbarVisible() As Boolean
+        Return Me.InspectorContentHeight() > Me.mGridHeight
+    End Function
+
+    Private Function ValueRight() As Integer
+        If Me.ScrollbarVisible() Then Return Me.mInspectorW - 14
+        Return Me.mInspectorW - 8
+    End Function
+
+    Private Function CommandButtonSize(count As Integer) As Double
+        Dim available As Double = Me.ValueRight() - 12.0
+        Dim size As Double = (available - (count - 1) * 4.0) / count
+        Return Math.Max(20.0, Math.Min(34.0, size))
+    End Function
+
+    Private Function ButtonSlot(row As LayoutInspectorRow, x As Double) As Integer
+        Dim count As Integer = Array.Count(row.Commands)
+        If count = 0 Then Return -1
+        Dim size As Double = Me.CommandButtonSize(count)
+        For i As Integer = 0 To count - 1
+            Dim bx As Double = 12.0 + i * (size + 4.0)
+            If x >= bx And x <= bx + size Then Return i
+        Next
+        Return -1
+    End Function
+
+    Public Sub InspectorGridMouseDown(x As Double, y As Double, clicks As Integer, secondary As Boolean)
+        If Me.ScrollbarVisible() And x >= Me.mInspectorW - 12 Then
+            Me.mScrollDrag = True
+            Me.mScrollDragStart = y
+            Me.mScrollDragOrigin = Me.mInspectorScroll
+            Dim content As Double = Me.InspectorContentHeight()
+            Dim view As Double = Me.mGridHeight
+            Dim thumb As Double = Math.Max(24.0, view * view / content)
+            Dim thumbTop As Double = Me.mInspectorScroll * (view - thumb) / Math.Max(1.0, content - view)
+            If y < thumbTop Or y > thumbTop + thumb Then
+                ' Page towards the click, then keep dragging from there.
+                If y < thumbTop Then
+                    Me.mInspectorScroll -= Me.mGridHeight - 24
+                Else
+                    Me.mInspectorScroll += Me.mGridHeight - 24
+                End If
+                Me.ClampInspectorScroll()
+                Me.mScrollDragOrigin = Me.mInspectorScroll
+                Me.PositionInspectorOverlays()
+                Me.mInspectorGrid.Invalidate()
+            End If
+            Return
+        End If
+        Dim index As Integer = Me.RowAt(y)
+        If index < 0 Then Return
+        Dim row As LayoutInspectorRow = Me.mRows(index)
+        Select Case row.Kind
+            Case "section"
+                If Me.mMode = "constraints" And row.Label = "Constraints" And x >= Me.ValueRight() - 26 Then
+                    Me.ShowConstraintAt(0)
+                    Return
+                End If
+                Me.ActivateInspectorRow(row.Key)
+                Me.ToggleInspectorSection(row.Label)
+                Return
+            Case "message", "cfield"
+                Return
+            Case "buttons"
+                Dim slot As Integer = Me.ButtonSlot(row, x)
+                If slot >= 0 Then Me.RunInspectorCommand(row.Commands(slot))
+                Return
+            Case "cbuttons"
+                If x < Me.mInspectorW / 2 Then
+                    Me.ApplyConstraintFromFields()
+                Else
+                    Me.DeleteConstraintFromField()
+                End If
+                Return
+            Case "constraint"
+                Me.ShowConstraintAt(row.PropertyIndex)
+                Return
+        End Select
+        Dim key As String = row.Key
+        If Not LayoutInspectorKit.SameText(key, Me.mActiveKey) Then Me.ActivateInspectorRow(key)
+        row = Me.FindInspectorRow(key)
+        If row = Nil Or secondary Then Return
+        If x < Me.InspectorLabelWidth() Then Return
+        Select Case row.Editor
+            Case "bool"
+                Me.ToggleBooleanRow(key)
+            Case "plugin"
+                Me.ApplyPropertyField()
+            Case "number", "geometry"
+                If x >= Me.ValueRight() - 16 Then
+                    Dim at As Integer = Me.VisibleRowIndex(key)
+                    If at >= 0 Then
+                        Dim middle As Double = Me.RowTop(at) - Me.mInspectorScroll + Me.RowHeightOf(row) / 2.0
+                        If y < middle Then
+                            Me.StepInspectorValue(key, 1)
+                        Else
+                            Me.StepInspectorValue(key, -1)
+                        End If
+                    End If
+                ElseIf Me.mValueField.Visible Then
+                    Me.mValueField.Focus()
+                End If
+            Case "name", "text", "raw"
+                If Me.mValueField.Visible Then Me.mValueField.Focus()
+        End Select
+    End Sub
+
+    Public Sub InspectorGridMouseDrag(x As Double, y As Double)
+        If Not Me.mScrollDrag Then Return
+        Dim content As Double = Me.InspectorContentHeight()
+        Dim view As Double = Me.mGridHeight
+        Dim thumb As Double = Math.Max(24.0, view * view / Math.Max(1.0, content))
+        Dim ratio As Double = (content - view) / Math.Max(1.0, view - thumb)
+        Me.mInspectorScroll = Me.mScrollDragOrigin + Math.Round((y - Me.mScrollDragStart) * ratio)
+        Me.ClampInspectorScroll()
+        Me.PositionInspectorOverlays()
+        Me.mInspectorGrid.Invalidate()
+    End Sub
+
+    Public Sub InspectorGridMouseUp()
+        Me.mScrollDrag = False
+    End Sub
+
+    Public Sub InspectorGridHover(x As Double, y As Double)
+        Dim key As String = ""
+        Dim button As Integer = -1
+        If x >= 0.0 Then
+            Dim index As Integer = Me.RowAt(y)
+            If index >= 0 Then
+                Dim row As LayoutInspectorRow = Me.mRows(index)
+                key = row.Key
+                If row.Kind = "buttons" Then button = Me.ButtonSlot(row, x)
+                If row.Kind = "cbuttons" Then
+                    button = 1
+                    If x < Me.mInspectorW / 2 Then button = 0
+                End If
+            End If
+        End If
+        If key = Me.mHoverKey And button = Me.mHoverButton Then Return
+        Me.mHoverKey = key
+        Me.mHoverButton = button
+        Me.mInspectorGrid.Invalidate()
+        Me.mInspectorDetail.Invalidate()
+    End Sub
+
+    Private Function SelectableRow(row As LayoutInspectorRow) As Boolean
+        Return row.Kind <> "message" And row.Kind <> "buttons" And row.Kind <> "cbuttons" And row.Kind <> "cfield"
+    End Function
+
+    Private Sub MoveActiveRow(direction As Integer)
+        Dim count As Integer = Array.Count(Me.mRows)
+        If count = 0 Or direction = 0 Then Return
+        Dim index As Integer = Me.VisibleRowIndex(Me.mActiveKey)
+        Dim stepSign As Integer = 1
+        If direction < 0 Then stepSign = -1
+        Dim remaining As Integer = Math.Abs(direction)
+        If index < 0 Then
+            index = -1
+            If stepSign < 0 Then index = count
+        End If
+        Dim target As Integer = -1
+        Dim probe As Integer = index
+        While remaining > 0
+            probe += stepSign
+            If probe < 0 Or probe >= count Then Exit While
+            If Me.SelectableRow(Me.mRows(probe)) Then
+                target = probe
+                remaining -= 1
+            End If
+        End While
+        If target < 0 Then Return
+        Dim row As LayoutInspectorRow = Me.mRows(target)
+        If row.Kind = "constraint" Then
+            Me.ShowConstraintAt(row.PropertyIndex)
+        ElseIf row.Kind = "section" Then
+            Me.ActivateInspectorRow(row.Key)
+        Else
+            Me.ActivateInspectorRow(row.Key)
+        End If
+        Me.RevealInspectorRow(row.Key)
+    End Sub
+
+    Public Function InspectorGridKey(key As KeyName, shift As Boolean) As Boolean
+        Dim page As Integer = Math.Max(1, Me.mGridHeight \ Math.Max(1, Me.InspectorRowHeight()) - 1)
+        Select Case key
+            Case KeyName.Up
+                Me.MoveActiveRow(-1)
+                Return True
+            Case KeyName.Down
+                Me.MoveActiveRow(1)
+                Return True
+            Case KeyName.PageUp
+                Me.MoveActiveRow(-page)
+                Return True
+            Case KeyName.PageDown
+                Me.MoveActiveRow(page)
+                Return True
+            Case KeyName.Home
+                Me.mActiveKey = ""
+                Me.MoveActiveRow(1)
+                Return True
+            Case KeyName.EndKey
+                Me.mActiveKey = ""
+                Me.MoveActiveRow(-1)
+                Return True
+        End Select
+        Dim row As LayoutInspectorRow = Me.FindInspectorRow(Me.mActiveKey)
+        If row = Nil Then Return False
+        If row.Kind = "section" Then
+            Dim collapsed As Boolean = Array.Contains(Me.mCollapsedSections, row.Label)
+            If (key = KeyName.Left And Not collapsed) Or (key = KeyName.Right And collapsed) Or key = KeyName.Return Or key = KeyName.Space Then
+                Me.ToggleInspectorSection(row.Label)
+                Return True
+            End If
+            Return False
+        End If
+        Select Case key
+            Case KeyName.Space
+                If row.Editor = "bool" Then
+                    Me.ToggleBooleanRow(row.Key)
+                    Return True
+                End If
+            Case KeyName.Return
+                If row.Editor = "bool" Then
+                    Me.ToggleBooleanRow(row.Key)
+                    Return True
+                End If
+                If row.Editor = "plugin" Then
+                    Me.ApplyPropertyField()
+                    Return True
+                End If
+                If Me.mValueField.Visible Then
+                    Me.mValueField.Focus()
+                    Return True
+                End If
+                If Me.mValuePopup.Visible Then
+                    Me.mValuePopup.Focus()
+                    Return True
+                End If
+            Case KeyName.Left, KeyName.Right
+                If row.Editor = "number" Or row.Editor = "geometry" Then
+                    Dim direction As Integer = 1
+                    If key = KeyName.Left Then direction = -1
+                    If shift Then direction *= 10
+                    Me.StepInspectorValue(row.Key, direction)
+                    Return True
+                End If
+            Case KeyName.Escape
+                If Me.mFilterText <> "" Then
+                    Me.InspectorFilter = ""
+                    Return True
+                End If
+        End Select
+        Return False
+    End Function
+
+    Public Sub InspectorBackdropClick(x As Double, y As Double)
+        If y < Me.mSegmentTop Or y > Me.mSegmentTop + 26 Then Return
+        If x < 10.0 Or x > Me.mInspectorW - 10 Then Return
+        If x < Me.mInspectorW / 2 Then
+            Me.InspectorMode = "properties"
+        Else
+            Me.InspectorMode = "constraints"
+        End If
+    End Sub
+
+    ' ------------------------------------------------------------------
+    ' Layout
+    ' ------------------------------------------------------------------
+
+    Private Sub BuildInspector()
+        Me.mInspectorPane.AddSubview(Me.mInspector)
+        Me.mInspectorBackdrop.Owner = Me
+        Me.mInspectorBackdrop.Focusable = True
+        Me.mInspectorBackdrop.AccessibleRole = AccessibleRole.Group
+        Me.mInspectorBackdrop.AccessibleLabel = "Inspector mode: Properties"
+        Me.mInspectorBackdrop.AccessibleHint = "Left and Right choose Properties or Constraints. Space toggles modes. Return focuses inspector rows."
+        Me.mInspector.AddSubview(Me.mInspectorBackdrop)
+        Me.mRootPicker.Owner = Me
+        Me.mRootPicker.Focusable = True
+        Me.mRootPicker.AccessibleLabel = "Layout root"
+        Me.mInspector.AddSubview(Me.mRootPicker)
+        Me.mInspectorFilter.Owner = Me
+        Me.mInspectorFilter.Purpose = "filter"
+        Me.mInspectorFilter.Placeholder = "Filter properties"
+        Me.mInspectorFilter.AccessibleLabel = "Filter inspector properties"
+        Me.mInspector.AddSubview(Me.mInspectorFilter)
+        Me.mInspectorGrid.Owner = Me
+        Me.mInspectorGrid.Focusable = True
+        Me.mInspectorGrid.AccessibleRole = AccessibleRole.List
+        Me.mInspectorGrid.AccessibleLabel = "Properties inspector"
+        Me.mInspectorGrid.AccessibleHint = "Up and Down select rows. Return edits the selected property, Space toggles booleans, and Left or Right collapse or expand sections."
+        Me.mInspector.AddSubview(Me.mInspectorGrid)
+        Me.mInspectorDetail.Owner = Me
+        Me.mInspectorDetail.AccessibleHidden = True
+        Me.mInspector.AddSubview(Me.mInspectorDetail)
+        Me.mValueField.Owner = Me
+        Me.mValueField.Purpose = "value"
+        Me.mValueField.AccessibleLabel = "Property value"
+        Me.mValueField.Visible = False
+        Me.mInspector.AddSubview(Me.mValueField)
+        Me.mValuePopup.Owner = Me
+        Me.mValuePopup.Focusable = True
+        Me.mValuePopup.AccessibleLabel = "Property choice"
+        Me.mValuePopup.Visible = False
+        Me.mInspector.AddSubview(Me.mValuePopup)
+        Me.mConstraintOffset.Owner = Me
+        Me.mConstraintOffset.Purpose = "offset"
+        Me.mConstraintOffset.Placeholder = "0"
+        Me.mConstraintOffset.AccessibleLabel = "Constraint offset"
+        Dim constraintPickers As Array Of ComboBox = [Me.mConstraintLeftNode, Me.mConstraintLeftAnchor, Me.mConstraintRelation, Me.mConstraintRightNode, Me.mConstraintRightAnchor, Me.mConstraintPriority]
+        Dim constraintLabels As Array Of String = ["Constraint left control", "Constraint left anchor", "Constraint relation", "Constraint right control", "Constraint right anchor", "Constraint priority"]
+        For i As Integer = 0 To Array.LastIndex(constraintPickers)
+            constraintPickers(i).Focusable = True
+            constraintPickers(i).AccessibleLabel = constraintLabels(i)
+        Next
+        Me.mInspector.AddSubview(Me.mConstraintLeftNode)
+        Me.mInspector.AddSubview(Me.mConstraintLeftAnchor)
+        Me.mInspector.AddSubview(Me.mConstraintRelation)
+        Me.mInspector.AddSubview(Me.mConstraintRightNode)
+        Me.mInspector.AddSubview(Me.mConstraintRightAnchor)
+        Me.mInspector.AddSubview(Me.mConstraintOffset)
+        Me.mInspector.AddSubview(Me.mConstraintPriority)
+        Me.HideConstraintOverlays()
+    End Sub
+
+    Private Function InspectorPanelWidth() As Integer
+        If Me.mInspectorCollapsed Then Return 0
+        Return Me.mInspectorWidth
+    End Function
+
+    Private Sub RelayoutInspector()
+        Me.LayoutInspectorArea(Me.mInspectorX, Me.mInspectorY, Me.mInspectorW, Me.mInspectorH)
+    End Sub
+
+    Private Sub LayoutInspectorArea(x As Integer, y As Integer, width As Integer, height As Integer)
+        Me.mInspectorX = x
+        Me.mInspectorY = y
+        If width <= 0 Or Me.mInspectorCollapsed Then
+            Me.mInspector.Visible = False
+            Me.mInspector.Move(x, y, 1, Math.Max(1, height))
+            Return
+        End If
+        Me.mInspector.Visible = True
+        Me.mInspectorW = Math.Max(1, width)
+        Me.mInspectorH = Math.Max(1, height)
+        Me.mInspector.Move(x, y, Me.mInspectorW, Me.mInspectorH)
+        Me.mInspectorBackdrop.Move(0, 0, Me.mInspectorW, Me.mInspectorH)
+        Dim ch As Integer = Me.InspectorControlHeight()
+        Me.mRootPicker.Move(10, 8, Math.Max(1, Me.mInspectorW - 20), ch)
+        Me.mHeaderTop = 8 + ch + 10
+        Me.mSegmentTop = Me.mHeaderTop + 40
+        Me.mFilterTop = Me.mSegmentTop + 26 + 10
+        Me.LayoutInspectorBody()
+        Me.mInspectorBackdrop.Invalidate()
+    End Sub
+
+    ''' Grid, filter, detail line, custom view and overlays (cheap; called on every
+    ''' row change because the detail height depends on the active editor).
+    Private Sub LayoutInspectorBody()
+        If Me.mInspectorCollapsed Then Return
+        Dim ch As Integer = Me.InspectorControlHeight()
+        Dim w As Integer = Me.mInspectorW
+        Dim gridTop As Integer = Me.mFilterTop
+        If Me.mMode = "constraints" Then
+            Me.mInspectorFilter.Visible = False
+        Else
+            Me.mInspectorFilter.Visible = True
+            Me.mInspectorFilter.Move(10, Me.mFilterTop, Math.Max(1, w - 20), ch)
+            gridTop = Me.mFilterTop + ch + 8
+        End If
+        Me.mDetailHeight = 64
+        If Me.mActiveCustom <> Nil Then Me.mDetailHeight = 64 + 76
+        Me.mGridTop = gridTop
+        Me.mGridHeight = Math.Max(1, Me.mInspectorH - gridTop - Me.mDetailHeight)
+        Me.mInspectorGrid.Move(0, gridTop, w, Me.mGridHeight)
+        Me.mInspectorDetail.Move(0, gridTop + Me.mGridHeight, w, Me.mDetailHeight)
+        If Me.mActiveCustom <> Nil Then Me.mActiveCustom.Move(12, gridTop + Me.mGridHeight + 64, Math.Max(1, w - 24), 68)
+        Me.ClampInspectorScroll()
+        Me.PositionInspectorOverlays()
+    End Sub
+
+    Private Sub HideConstraintOverlays()
+        Me.mConstraintLeftNode.Visible = False
+        Me.mConstraintLeftAnchor.Visible = False
+        Me.mConstraintRelation.Visible = False
+        Me.mConstraintRightNode.Visible = False
+        Me.mConstraintRightAnchor.Visible = False
+        Me.mConstraintOffset.Visible = False
+        Me.mConstraintPriority.Visible = False
+    End Sub
+
+    Private Sub PositionInspectorOverlays()
+        Dim ch As Integer = Me.InspectorControlHeight()
+        Dim left As Integer = Me.InspectorLabelWidth() + 4
+        Dim right As Integer = Me.ValueRight()
+        Dim top As Integer = -Me.mInspectorScroll
+        Me.HideConstraintOverlays()
+        Dim fieldPlaced As Boolean = False
+        Dim popupPlaced As Boolean = False
+        For Each row As LayoutInspectorRow In Me.mRows
+            Dim h As Integer = Me.RowHeightOf(row)
+            Dim inView As Boolean = top >= 0 And top + h <= Me.mGridHeight
+            Dim cy As Integer = Me.mGridTop + top + (h - ch) \ 2
+            If inView And Me.RowHasOverlay(row) Then
+                If row.Kind = "cfield" Then
+                    Me.PlaceConstraintControl(row.Key, left, cy, Math.Max(1, right - left), ch)
+                ElseIf LayoutInspectorKit.SameText(row.Key, Me.mEditKey) Then
+                    If row.Editor = "enum" Then
+                        Me.mValuePopup.Move(left, cy, Math.Max(1, right - left), ch)
+                        popupPlaced = True
+                    Else
+                        Dim fieldRight As Integer = right
+                        If row.Editor = "number" Or row.Editor = "geometry" Then fieldRight = right - 20
+                        Me.mValueField.Move(left, cy, Math.Max(1, fieldRight - left), ch)
+                        fieldPlaced = True
+                    End If
+                End If
+            End If
+            top += h
+        Next
+        ' Scrolled out of view: park the editor instead of overlapping the header.
+        If Not fieldPlaced Then Me.mValueField.Move(-2000, -2000, 10, ch)
+        If Not popupPlaced Then Me.mValuePopup.Move(-2000, -2000, 10, ch)
+    End Sub
+
+    Private Sub PlaceConstraintControl(key As String, x As Integer, y As Integer, w As Integer, h As Integer)
+        Select Case key
+            Case "c:left"
+                Me.mConstraintLeftNode.Visible = True
+                Me.mConstraintLeftNode.Move(x, y, w, h)
+            Case "c:leftAnchor"
+                Me.mConstraintLeftAnchor.Visible = True
+                Me.mConstraintLeftAnchor.Move(x, y, w, h)
+            Case "c:relation"
+                Me.mConstraintRelation.Visible = True
+                Me.mConstraintRelation.Move(x, y, w, h)
+            Case "c:right"
+                Me.mConstraintRightNode.Visible = True
+                Me.mConstraintRightNode.Move(x, y, w, h)
+            Case "c:rightAnchor"
+                Me.mConstraintRightAnchor.Visible = True
+                Me.mConstraintRightAnchor.Move(x, y, w, h)
+            Case "c:offset"
+                Me.mConstraintOffset.Visible = True
+                Me.mConstraintOffset.Move(x, y, w, h)
+            Case "c:priority"
+                Me.mConstraintPriority.Visible = True
+                Me.mConstraintPriority.Move(x, y, w, h)
+        End Select
+    End Sub
+
+    ''' Inspector-owned commands routed from PerformCommand. Returns whether the
+    ''' command is known and enabled; performs it only when perform is True.
+    Private Function InspectorPanelCommand(command As String, perform As Boolean) As Boolean
+        Select Case command
+            Case "toggle-inspector"
+                If perform Then
+                    Me.mInspectorCollapsed = Not Me.mInspectorCollapsed
+                    Me.RelayoutPanel()
+                End If
+                Return True
+            Case "inspector-properties", "inspector-constraints"
+                If perform Then
+                    If Me.mInspectorCollapsed Then
+                        Me.mInspectorCollapsed = False
+                        Me.RelayoutPanel()
+                    End If
+                    If command = "inspector-properties" Then
+                        Me.InspectorMode = "properties"
+                        Me.mInspectorFilter.Focus()
+                    Else
+                        Me.InspectorMode = "constraints"
+                        Me.mInspectorGrid.Focus()
+                    End If
+                End If
+                Return True
+            Case "inspector-rename"
+                If Array.Count(Me.InspectorSelection()) <> 1 Or Not Me.RefactorAvailable Then Return False
+                If perform Then Return Me.FocusInspectorRow("name")
+                Return True
+        End Select
+        Return False
+    End Function
+
+    ''' Double-click on a control: reveal the inspector and focus its primary
+    ''' text-like property (Caption, Text, Title...) for immediate editing.
+    Private Sub FocusPrimaryProperty()
+        Me.EditPrimaryProperty()
+    End Sub
+
+    ' ------------------------------------------------------------------
+    ' Painting
+    ' ------------------------------------------------------------------
+
+    Private Function InspectorDark() As Boolean
+        Return Me.ChromeDark
+    End Function
+
+    Public Sub InspectorPaintBackdrop(g As Graphics)
+        Dim dark As Boolean = Me.InspectorDark()
+        Dim w As Double = Me.mInspectorW
+        Dim h As Double = Me.mInspectorH
+        g.FillRect(0.0, 0.0, w, h, LayoutInspectorKit.InspectorColor("panel", dark))
+        g.DrawLine(0.5, 0.0, 0.5, h, 1.0, LayoutInspectorKit.InspectorColor("line", dark))
+        Dim ink As Color = LayoutInspectorKit.InspectorColor("ink", dark)
+        Dim muted As Color = LayoutInspectorKit.InspectorColor("muted", dark)
+        Dim top As Double = Me.mHeaderTop
+        Dim ids As Array Of String = Me.InspectorSelection()
+        Dim title As String = "No selection"
+        Dim subtitle As String = "Click a control on the canvas"
+        Dim iconType As String = ""
+        If Array.Count(ids) = 1 Then
+            Dim node As LayoutNode = Me.mDocument.FindNode(ids(0))
+            title = node.Name
+            subtitle = node.TypeName
+            iconType = node.TypeName
+            Dim control As LayoutControlDescriptor = Me.ResolveDescriptor(node.TypeName)
+            If control <> Nil Then
+                iconType = control.TypeName
+                If control.PackageName <> "builtin" Then subtitle = node.TypeName + " · " + control.PackageName
+            End If
+        ElseIf Array.Count(ids) > 1 Then
+            title = String.From(Array.Count(ids)) + " controls selected"
+            subtitle = "Key object: " + Me.mDocument.FindNode(ids(0)).Name
+            iconType = "*multiple"
+        ElseIf Me.mDocument = Nil Then
+            title = "No layout"
+            subtitle = "Open a .bui file with a layout"
+        End If
+        Me.PaintInspectorIcon(g, iconType, 12.0, top + 2.0, 30.0, dark)
+        g.Bold = True
+        g.DrawString(LayoutInspectorKit.FitText(g, title, "", 13.0, w - 64.0), 52.0, top + 15.0, "", 13.0, ink)
+        g.Bold = False
+        g.DrawString(LayoutInspectorKit.FitText(g, subtitle, "", 11.0, w - 64.0), 52.0, top + 31.0, "", 11.0, muted)
+        ' Segmented mode switch: the OS segmented control where available (its
+        ' equal halves match the hit-testing), else a painted approximation.
+        Dim sy As Double = Me.mSegmentTop
+        Dim sw As Double = w - 20.0
+        Dim constraints As Boolean = Me.mMode = "constraints"
+        Dim labels As Array Of String = ["Properties", "Constraints"]
+        Dim selectedSegment As Integer = 0
+        If constraints Then selectedSegment = 1
+        If Not Me.mNativePainter.PaintSegments(g, labels, selectedSegment, 10.0, sy, sw, 26.0, dark, 1.0) Then
+            g.FillRoundedRect(10.0, sy, sw, 26.0, 6.0, LayoutInspectorKit.InspectorColor("section", dark))
+            Dim activeX As Double = 12.0
+            If constraints Then activeX = 10.0 + sw / 2.0
+            g.FillRoundedRect(activeX, sy + 2.0, sw / 2.0 - 2.0, 22.0, 5.0, LayoutInspectorKit.InspectorColor("field", dark))
+            g.StrokeRoundedRect(activeX, sy + 2.0, sw / 2.0 - 2.0, 22.0, 5.0, 1.0, LayoutInspectorKit.InspectorColor("line", dark))
+            For i As Integer = 0 To 1
+                Dim isActive As Boolean = (i = 1) = constraints
+                Dim color As Color = muted
+                If isActive Then color = ink
+                g.Bold = isActive
+                Dim tw As Double = g.MeasureStringWidth(labels(i), "", 12.0)
+                g.DrawString(labels(i), 10.0 + i * sw / 2.0 + (sw / 2.0 - tw) / 2.0, sy + 17.5, "", 12.0, color)
+                g.Bold = False
+            Next
+        End If
+        g.DrawLine(0.0, Me.mFilterTop - 5.5, w, Me.mFilterTop - 5.5, 1.0, LayoutInspectorKit.InspectorColor("line", dark))
+    End Sub
+
+    ''' Catalog icon for the selected control; a neutral monogram as fallback.
+    Private Sub PaintInspectorIcon(g As Graphics, typeName As String, x As Double, y As Double, size As Double, dark As Boolean)
+        Dim accent As Color = LayoutInspectorKit.InspectorColor("accent", dark)
+        If typeName = "" Then
+            g.StrokeRoundedRect(x + 0.5, y + 0.5, size - 1.0, size - 1.0, 7.0, 1.0, LayoutInspectorKit.InspectorColor("line", dark))
+            Return
+        End If
+        If typeName = "*multiple" Then
+            g.StrokeRoundedRect(x + 6.5, y + 0.5, size - 7.0, size - 7.0, 5.0, 1.5, accent)
+            g.FillRoundedRect(x + 0.5, y + 6.5, size - 7.0, size - 7.0, 5.0, LayoutInspectorKit.InspectorColor("panel", dark))
+            g.StrokeRoundedRect(x + 0.5, y + 6.5, size - 7.0, size - 7.0, 5.0, 1.5, accent)
+            Return
+        End If
+        g.Save()
+        Try
+            Me.PaintCatalogIcon(g, typeName, x, y, size, dark)
+        Catch e As Exception
+            g.FillRoundedRect(x, y, size, size, 7.0, LayoutInspectorKit.InspectorColor("section", dark))
+        Finally
+            g.Restore()
+        End Try
+    End Sub
+
+    Private Sub PaintCatalogIcon(g As Graphics, typeName As String, x As Double, y As Double, size As Double, dark As Boolean)
+        g.FillRoundedRect(x, y, size, size, 7.0, LayoutInspectorKit.InspectorColor("active", dark))
+        Dim inset As Double = Math.Round(size * 0.15)
+        ' Package controls appear in source by bare name; icons are keyed by catalog identity.
+        Dim descriptor As LayoutControlDescriptor = Me.ResolveDescriptor(typeName)
+        If descriptor <> Nil Then typeName = descriptor.TypeName
+        Me.mCatalog.IconFor(typeName).PaintIcon(g, x + inset, y + inset, size - inset * 2.0, dark)
+    End Sub
+
+    Public Sub InspectorPaintGrid(g As Graphics)
+        Dim dark As Boolean = Me.InspectorDark()
+        Dim w As Double = Me.mInspectorW
+        Dim h As Double = Me.mGridHeight
+        g.FillRect(0.0, 0.0, w, h, LayoutInspectorKit.InspectorColor("panel", dark))
+        Dim top As Integer = -Me.mInspectorScroll
+        Dim stripe As Integer = 0
+        For i As Integer = 0 To Array.Count(Me.mRows) - 1
+            Dim row As LayoutInspectorRow = Me.mRows(i)
+            Dim rh As Integer = Me.RowHeightOf(row)
+            If top + rh > 0 And top < h Then
+                g.Save()
+                Try
+                    g.ClipToRect(0.0, top, w, rh)
+                    Me.PaintInspectorRow(g, row, top, rh, stripe, dark)
+                Finally
+                    g.Restore()
+                End Try
+            End If
+            If row.Kind = "section" Then
+                stripe = 0
+            Else
+                stripe += 1
+            End If
+            top += rh
+        Next
+        g.DrawLine(0.5, 0.0, 0.5, h, 1.0, LayoutInspectorKit.InspectorColor("line", dark))
+        If Me.ScrollbarVisible() Then
+            Dim content As Double = Me.InspectorContentHeight()
+            Dim thumb As Double = Math.Max(24.0, h * h / content)
+            Dim thumbTop As Double = Me.mInspectorScroll * (h - thumb) / Math.Max(1.0, content - h)
+            Dim bar As Color = LayoutInspectorKit.InspectorColor("muted", dark)
+            g.FillRoundedRect(w - 9.0, thumbTop + 2.0, 5.0, thumb - 4.0, 2.5, Color.RGBA(bar.R, bar.G, bar.B, 0.45))
+        End If
+    End Sub
+
+    Private Sub PaintInspectorRow(g As Graphics, row As LayoutInspectorRow, top As Double, rh As Double, stripe As Integer, dark As Boolean)
+        Dim w As Double = Me.mInspectorW
+        Dim ink As Color = LayoutInspectorKit.InspectorColor("ink", dark)
+        Dim muted As Color = LayoutInspectorKit.InspectorColor("muted", dark)
+        Dim line As Color = LayoutInspectorKit.InspectorColor("line", dark)
+        Dim accent As Color = LayoutInspectorKit.InspectorColor("accent", dark)
+        Dim labelW As Double = Me.InspectorLabelWidth()
+        Dim right As Double = Me.ValueRight()
+        Dim baseline As Double = top + rh / 2.0 + 4.0
+        Dim active As Boolean = LayoutInspectorKit.SameText(row.Key, Me.mActiveKey)
+        Select Case row.Kind
+            Case "section"
+                g.FillRect(0.0, top, w, rh, LayoutInspectorKit.InspectorColor("section", dark))
+                g.DrawLine(0.0, top + rh - 0.5, w, top + rh - 0.5, 1.0, line)
+                If active Then g.FillRect(0.0, top, 3.0, rh, accent)
+                Dim collapsed As Boolean = Array.Contains(Me.mCollapsedSections, row.Label) And Me.mFilterText = ""
+                Dim cx As Double = 14.0
+                Dim cy As Double = top + rh / 2.0
+                g.BeginPath()
+                If collapsed Then
+                    g.MoveTo(cx - 2.0, cy - 4.0)
+                    g.LineTo(cx + 3.0, cy)
+                    g.LineTo(cx - 2.0, cy + 4.0)
+                Else
+                    g.MoveTo(cx - 4.0, cy - 2.0)
+                    g.LineTo(cx + 4.0, cy - 2.0)
+                    g.LineTo(cx, cy + 3.0)
+                End If
+                g.ClosePath()
+                g.FillPath(muted)
+                g.Bold = True
+                g.DrawString(LayoutInspectorKit.FitText(g, row.Label, "", 11.5, w - 80.0), 26.0, baseline, "", 11.5, ink)
+                g.Bold = False
+                If Me.mMode = "constraints" And row.Label = "Constraints" Then
+                    Dim bx As Double = right - 22.0
+                    Dim by As Double = top + (rh - 18.0) / 2.0
+                    If Me.mHoverKey = row.Key Then g.FillRoundedRect(bx, by, 20.0, 18.0, 4.0, LayoutInspectorKit.InspectorColor("hover", dark))
+                    g.DrawLine(bx + 10.0, by + 4.0, bx + 10.0, by + 14.0, 1.6, accent)
+                    g.DrawLine(bx + 5.0, by + 9.0, bx + 15.0, by + 9.0, 1.6, accent)
+                ElseIf row.Count > 0 And (collapsed Or Me.mFilterText <> "") Then
+                    Dim countText As String = String.From(row.Count)
+                    Dim cw As Double = g.MeasureStringWidth(countText, "", 10.5)
+                    g.DrawString(countText, right - cw, baseline, "", 10.5, muted)
+                End If
+                Return
+            Case "message"
+                g.DrawString(LayoutInspectorKit.FitText(g, row.Value, "", 12.0, w - 28.0), 14.0, top + 26.0, "", 12.0, muted)
+                Return
+            Case "buttons"
+                Me.PaintCommandButtons(g, row, top, rh, dark)
+                Return
+            Case "cbuttons"
+                Me.PaintConstraintButtons(g, row, top, rh, dark)
+                Return
+        End Select
+        If stripe Mod 2 = 1 Then g.FillRect(0.0, top, w, rh, LayoutInspectorKit.InspectorColor("alt", dark))
+        If Me.mHoverKey = row.Key And Not active Then g.FillRect(0.0, top, w, rh, LayoutInspectorKit.InspectorColor("hover", dark))
+        If active Then
+            g.FillRect(0.0, top, w, rh, LayoutInspectorKit.InspectorColor("active", dark))
+            g.FillRect(0.0, top, 3.0, rh, accent)
+        End If
+        If row.Kind = "constraint" Then
+            Dim font As String = LayoutInspectorKit.InspectorMonoFont()
+            Dim tagW As Double = 0.0
+            If row.Value <> "" And row.Value <> "Required" Then
+                tagW = g.MeasureStringWidth(row.Value, "", 10.0) + 10.0
+                g.StrokeRoundedRect(right - tagW, top + (rh - 16.0) / 2.0, tagW, 16.0, 8.0, 1.0, muted)
+                g.DrawString(row.Value, right - tagW + 5.0, top + rh / 2.0 + 3.5, "", 10.0, muted)
+            End If
+            Dim color As Color = ink
+            If row.PropertyIndex = 0 Then
+                color = accent
+                font = ""
+            End If
+            g.DrawString(LayoutInspectorKit.FitText(g, row.Label, font, 11.5, right - 20.0 - tagW), 14.0, baseline, font, 11.5, color)
+            Return
+        End If
+        ' Label column.
+        Dim labelColor As Color = ink
+        If Not row.Present Then labelColor = muted
+        g.DrawString(LayoutInspectorKit.FitText(g, row.Label, "", 12.0, labelW - 20.0), 14.0, baseline, "", 12.0, labelColor)
+        g.DrawLine(labelW - 0.5, top, labelW - 0.5, top + rh, 1.0, line)
+        If row.Kind = "cfield" Then Return
+        Dim vx As Double = labelW + 8.0
+        Dim vw As Double = right - vx
+        If Me.RowHasOverlay(row) Then
+            If row.Editor = "number" Or row.Editor = "geometry" Then Me.PaintStepper(g, right - 8.0, top + rh / 2.0, dark)
+            Return
+        End If
+        Dim valueColor As Color = ink
+        Dim font As String = ""
+        If row.Monospace Then
+            font = LayoutInspectorKit.InspectorMonoFont()
+            valueColor = LayoutInspectorKit.InspectorColor("code", dark)
+        End If
+        If row.Editor = "readonly" Or Not row.Present Then valueColor = muted
+        Select Case row.Editor
+            Case "bool"
+                Dim by As Double = top + (rh - 15.0) / 2.0
+                If row.Checked Then
+                    g.FillRoundedRect(vx, by, 15.0, 15.0, 3.5, accent)
+                    g.DrawLine(vx + 3.5, by + 7.5, vx + 6.5, by + 10.5, 1.8, LayoutInspectorKit.InspectorColor("accentInk", dark))
+                    g.DrawLine(vx + 6.5, by + 10.5, vx + 11.5, by + 4.5, 1.8, LayoutInspectorKit.InspectorColor("accentInk", dark))
+                Else
+                    g.FillRoundedRect(vx, by, 15.0, 15.0, 3.5, LayoutInspectorKit.InspectorColor("field", dark))
+                    g.StrokeRoundedRect(vx + 0.5, by + 0.5, 14.0, 14.0, 3.5, 1.0, muted)
+                End If
+                g.DrawString(row.Value, vx + 22.0, baseline, "", 11.5, muted)
+                Return
+            Case "enum"
+                g.DrawString(LayoutInspectorKit.FitText(g, row.Value, "", 12.0, vw - 18.0), vx, baseline, "", 12.0, valueColor)
+                Dim cx As Double = right - 7.0
+                Dim cy As Double = top + rh / 2.0
+                g.DrawLine(cx - 4.0, cy - 2.0, cx, cy + 2.0, 1.4, muted)
+                g.DrawLine(cx, cy + 2.0, cx + 4.0, cy - 2.0, 1.4, muted)
+                Return
+            Case "plugin"
+                Dim bw As Double = g.MeasureStringWidth("Edit…", "", 11.0) + 14.0
+                g.FillRoundedRect(right - bw, top + (rh - 18.0) / 2.0, bw, 18.0, 4.0, LayoutInspectorKit.InspectorColor("section", dark))
+                g.StrokeRoundedRect(right - bw, top + (rh - 18.0) / 2.0, bw, 18.0, 4.0, 1.0, line)
+                g.DrawString("Edit…", right - bw + 7.0, top + rh / 2.0 + 4.0, "", 11.0, ink)
+                vw -= bw + 6.0
+        End Select
+        If row.HasSwatch Then
+            Dim sy As Double = top + (rh - 14.0) / 2.0
+            g.FillRoundedRect(vx, sy, 14.0, 14.0, 3.0, row.Swatch)
+            g.StrokeRoundedRect(vx + 0.5, sy + 0.5, 13.0, 13.0, 3.0, 1.0, line)
+            vx += 20.0
+            vw -= 20.0
+        End If
+        Dim text As String = row.Value
+        If row.Mixed Then
+            text = "Mixed"
+            valueColor = muted
+        ElseIf text = "" And row.Editor = "text" Then
+            text = "Empty"
+            valueColor = muted
+        End If
+        Dim tagWidth As Double = 0.0
+        If Not row.Present Then
+            tagWidth = g.MeasureStringWidth("default", "", 9.5) + 10.0
+            g.StrokeRoundedRect(right - tagWidth, top + (rh - 14.0) / 2.0, tagWidth, 14.0, 7.0, 1.0, line)
+            g.DrawString("default", right - tagWidth + 5.0, top + rh / 2.0 + 3.0, "", 9.5, muted)
+            tagWidth += 6.0
+        ElseIf row.Editor = "custom" Then
+            tagWidth = g.MeasureStringWidth("custom", "", 9.5) + 10.0
+            g.StrokeRoundedRect(right - tagWidth, top + (rh - 14.0) / 2.0, tagWidth, 14.0, 7.0, 1.0, accent)
+            g.DrawString("custom", right - tagWidth + 5.0, top + rh / 2.0 + 3.0, "", 9.5, accent)
+            tagWidth += 6.0
+        End If
+        Dim size As Double = 12.0
+        If font <> "" Then size = 11.5
+        g.DrawString(LayoutInspectorKit.FitText(g, text, font, size, vw - tagWidth), vx, baseline, font, size, valueColor)
+    End Sub
+
+    Private Sub PaintStepper(g As Graphics, cx As Double, cy As Double, dark As Boolean)
+        Dim muted As Color = LayoutInspectorKit.InspectorColor("muted", dark)
+        g.BeginPath()
+        g.MoveTo(cx - 4.0, cy - 2.5)
+        g.LineTo(cx + 4.0, cy - 2.5)
+        g.LineTo(cx, cy - 7.5)
+        g.ClosePath()
+        g.FillPath(muted)
+        g.BeginPath()
+        g.MoveTo(cx - 4.0, cy + 2.5)
+        g.LineTo(cx + 4.0, cy + 2.5)
+        g.LineTo(cx, cy + 7.5)
+        g.ClosePath()
+        g.FillPath(muted)
+    End Sub
+
+    Private Sub PaintCommandButtons(g As Graphics, row As LayoutInspectorRow, top As Double, rh As Double, dark As Boolean)
+        Dim count As Integer = Array.Count(row.Commands)
+        Dim size As Double = Me.CommandButtonSize(count)
+        Dim bh As Double = Math.Min(28.0, rh - 8.0)
+        Dim by As Double = top + (rh - bh) / 2.0
+        For i As Integer = 0 To count - 1
+            Dim bx As Double = 12.0 + i * (size + 4.0)
+            Dim enabled As Boolean = True
+            If i < Array.Count(row.CommandEnabled) Then enabled = row.CommandEnabled(i)
+            Dim hovered As Boolean = Me.mHoverKey = row.Key And Me.mHoverButton = i And enabled
+            Dim fill As Color = LayoutInspectorKit.InspectorColor("field", dark)
+            Dim border As Color = LayoutInspectorKit.InspectorColor("line", dark)
+            If hovered Then
+                fill = LayoutInspectorKit.InspectorColor("active", dark)
+                border = LayoutInspectorKit.InspectorColor("accent", dark)
+            End If
+            g.FillRoundedRect(bx, by, size, bh, 5.0, fill)
+            g.StrokeRoundedRect(bx + 0.5, by + 0.5, size - 1.0, bh - 1.0, 5.0, 1.0, border)
+            Dim glyph As Color = LayoutInspectorKit.InspectorColor("ink", dark)
+            If Not enabled Then
+                Dim muted As Color = LayoutInspectorKit.InspectorColor("muted", dark)
+                glyph = Color.RGBA(muted.R, muted.G, muted.B, 0.4)
+            End If
+            LayoutInspectorKit.PaintCommandGlyph(g, row.Commands(i), bx + size / 2.0, by + bh / 2.0, glyph)
+        Next
+    End Sub
+
+    Private Sub PaintConstraintButtons(g As Graphics, row As LayoutInspectorRow, top As Double, rh As Double, dark As Boolean)
+        Dim half As Double = Me.mInspectorW / 2.0
+        Dim bh As Double = Math.Min(28.0, rh - 8.0)
+        Dim by As Double = top + (rh - bh) / 2.0
+        For i As Integer = 0 To Array.Count(row.Commands) - 1
+            Dim bx As Double = 12.0
+            If i = 1 Then bx = half + 4.0
+            Dim bw As Double = half - 16.0
+            Dim primary As Boolean = i = 0
+            Dim enabled As Boolean = row.CommandEnabled(i)
+            Dim hovered As Boolean = Me.mHoverKey = row.Key And Me.mHoverButton = i And enabled
+            Dim fill As Color = LayoutInspectorKit.InspectorColor("field", dark)
+            Dim text As Color = LayoutInspectorKit.InspectorColor("ink", dark)
+            If primary And enabled Then
+                fill = LayoutInspectorKit.InspectorColor("accent", dark)
+                text = LayoutInspectorKit.InspectorColor("accentInk", dark)
+            End If
+            If Not enabled Then text = LayoutInspectorKit.InspectorColor("muted", dark)
+            g.FillRoundedRect(bx, by, bw, bh, 5.0, fill)
+            Dim border As Color = LayoutInspectorKit.InspectorColor("line", dark)
+            If hovered Then border = LayoutInspectorKit.InspectorColor("ink", dark)
+            g.StrokeRoundedRect(bx + 0.5, by + 0.5, bw - 1.0, bh - 1.0, 5.0, 1.0, border)
+            g.Bold = primary
+            Dim tw As Double = g.MeasureStringWidth(row.Commands(i), "", 12.0)
+            g.DrawString(row.Commands(i), bx + (bw - tw) / 2.0, by + bh / 2.0 + 4.0, "", 12.0, text)
+            g.Bold = False
+        Next
+    End Sub
+
+    Public Sub InspectorPaintDetail(g As Graphics)
+        Dim dark As Boolean = Me.InspectorDark()
+        Dim w As Double = Me.mInspectorW
+        Dim h As Double = Me.mDetailHeight
+        g.FillRect(0.0, 0.0, w, h, LayoutInspectorKit.InspectorColor("panel", dark))
+        g.DrawLine(0.0, 0.5, w, 0.5, 1.0, LayoutInspectorKit.InspectorColor("line", dark))
+        g.DrawLine(0.5, 0.0, 0.5, h, 1.0, LayoutInspectorKit.InspectorColor("line", dark))
+        Dim ink As Color = LayoutInspectorKit.InspectorColor("ink", dark)
+        Dim muted As Color = LayoutInspectorKit.InspectorColor("muted", dark)
+        Dim title As String = ""
+        Dim tag As String = ""
+        Dim detail As String = ""
+        Dim hovered As LayoutInspectorRow = Me.FindInspectorRow(Me.mHoverKey)
+        Dim showHover As Boolean = False
+        If hovered <> Nil And Me.mHoverButton >= 0 Then showHover = hovered.Kind = "buttons" And Me.mHoverButton < Array.Count(hovered.Commands)
+        If showHover Then
+            title = LayoutInspectorKit.InspectorCommandTitle(hovered.Commands(Me.mHoverButton))
+            detail = "Applies to the selection as one undoable edit."
+            If Me.mHoverButton < Array.Count(hovered.CommandEnabled) Then
+                If Not hovered.CommandEnabled(Me.mHoverButton) Then detail = "Not available for the current selection."
+            End If
+        Else
+            Dim row As LayoutInspectorRow = Me.FindInspectorRow(Me.mActiveKey)
+            If row <> Nil Then
+                title = row.Label
+                If row.Kind = "section" Then
+                    detail = String.From(row.Count) + " item(s). Click, Return or Left/Right collapses and expands."
+                Else
+                    tag = row.KindName
+                    If row.Editor = "readonly" Then
+                        tag = "read-only"
+                        If row.KindName <> "" Then tag = row.KindName + " · read-only"
+                    End If
+                    detail = row.Detail
+                End If
+            ElseIf Me.mMode = "constraints" Then
+                title = "Constraints"
+                detail = "Auto Layout constraints of the active Window."
+            Else
+                title = "Inspector"
+                detail = "Double-click a control to edit its text. Type in the filter to find a property."
+            End If
+        End If
+        Dim tagWidth As Double = 0.0
+        If tag <> "" Then tagWidth = g.MeasureStringWidth(tag, "", 10.5) + 8.0
+        g.Bold = True
+        g.DrawString(LayoutInspectorKit.FitText(g, title, "", 12.0, w - 24.0 - tagWidth), 12.0, 20.0, "", 12.0, ink)
+        g.Bold = False
+        If tag <> "" Then g.DrawString(tag, w - 12.0 - tagWidth + 8.0, 20.0, "", 10.5, muted)
+        ' Two wrapped lines of explanation.
+        Dim words As Array Of String = String.Split(detail, " ")
+        Dim lineText As String = ""
+        Dim lineY As Double = 37.0
+        Dim lines As Integer = 0
+        Dim maxWidth As Double = w - 24.0
+        For Each word As String In words
+            Dim candidate As String = word
+            If lineText <> "" Then candidate = lineText + " " + word
+            If g.MeasureStringWidth(candidate, "", 11.0) > maxWidth And lineText <> "" Then
+                If lines = 1 Then
+                    lineText = candidate
+                    Exit For
+                End If
+                g.DrawString(lineText, 12.0, lineY, "", 11.0, muted)
+                lines += 1
+                lineY += 15.0
+                lineText = word
+            Else
+                lineText = candidate
+            End If
+        Next
+        If lineText <> "" Then g.DrawString(LayoutInspectorKit.FitText(g, lineText, "", 11.0, maxWidth), 12.0, lineY, "", 11.0, muted)
+    End Sub
+
+    ' ------------------------------------------------------------------
+    ' Constraints mode
+    ' ------------------------------------------------------------------
+
+    Private Sub RefreshConstraintsMode()
+        Me.mConstraintIds = []
+        Me.mConstraintIds.Append("")
+        Me.mConstraintLeftNode.RemoveAllItems()
+        Me.mConstraintRightNode.RemoveAllItems()
+        Me.mConstraintNodeIds = []
+        Me.mConstraintLeftAnchor.RemoveAllItems()
+        Me.mConstraintRightAnchor.RemoveAllItems()
+        Me.mConstraintRelation.RemoveAllItems()
+        Me.mConstraintPriority.RemoveAllItems()
+        Me.mConstraintOffset.Text = "0"
+        If Not Me.ConstraintsSupported Then
+            Dim message As String = "Constraints require a Window root."
+            If Me.mDocument = Nil Then message = "Open a layout to edit its constraints."
+            Me.mAllRows = [Me.MessageRow(message)]
+            Me.ApplyRowFilterNoFilter()
+            Me.mActiveKey = ""
+            Me.InspectorRowsChanged()
+            Return
+        End If
+        Dim constraints As JSONItem = Me.Constraints()
+        For i As Integer = 0 To constraints.Count() - 1
+            Me.mConstraintIds.Append(constraints.ValueAt(i).Value("id").AsString().Or(""))
+        Next
+        For Each node As LayoutNode In Me.mDocument.Nodes
+            If Not Me.InActiveRoot(node) Then Continue For
+            If node.ParentId = "" Then Continue For
+            Me.mConstraintNodeIds.Append(node.Id)
+            Me.mConstraintLeftNode.AddItem(node.Name)
+            Me.mConstraintRightNode.AddItem(node.Name)
+        Next
+        Me.mConstraintRightNode.AddItem("SafeArea")
+        Me.mConstraintRightNode.AddItem("(constant)")
+        For Each anchor As String In LayoutInspectorKit.ConstraintAnchors()
+            Me.mConstraintLeftAnchor.AddItem(LayoutInspectorKit.ShortAnchor(anchor))
+            Me.mConstraintRightAnchor.AddItem(LayoutInspectorKit.ShortAnchor(anchor))
+        Next
+        Me.mConstraintRelation.AddItem("=")
+        Me.mConstraintRelation.AddItem("≤")
+        Me.mConstraintRelation.AddItem("≥")
+        Me.mConstraintRelation.SelectedIndex = 0
+        For Each priority As String In ["Required", "High", "Medium", "Low"]
+            Me.mConstraintPriority.AddItem(priority)
+        Next
+        Me.mConstraintPriority.SelectedIndex = 0
+        ' Keep the selected constraint selected after an edit when it still exists.
+        Me.ShowConstraintAt(Me.mConstraintIndex)
+    End Sub
+
+    Private Sub ApplyRowFilterNoFilter()
+        Dim saved As String = Me.mFilterText
+        Me.mFilterText = ""
+        Me.ApplyRowFilter()
+        Me.mFilterText = saved
+    End Sub
+
+    Private Sub BuildConstraintRows()
+        Dim rows As Array Of LayoutInspectorRow = []
+        Dim constraints As JSONItem = Me.Constraints()
+        rows.Append(Me.SectionRow("Constraints"))
+        Dim add As LayoutInspectorRow = Me.NewRow("constraint", "constraint:0", "New constraint…", "Constraints")
+        add.PropertyIndex = 0
+        add.Detail = "Create a constraint between two controls, the safe area or a constant."
+        rows.Append(add)
+        For i As Integer = 0 To constraints.Count() - 1
+            Dim data As JSONItem = constraints.ValueAt(i)
+            Dim row As LayoutInspectorRow = Me.NewRow("constraint", "constraint:" + String.From(i + 1), Me.FormatConstraint(data), "Constraints")
+            row.PropertyIndex = i + 1
+            row.Value = data.Value("priority").AsString().Or("Required")
+            row.Detail = data.Value("raw").AsString().Or("")
+            row.KindName = "constraint"
+            rows.Append(row)
+        Next
+        Dim editing As String = "New constraint"
+        If Me.mConstraintIndex > 0 Then editing = "Edit constraint"
+        rows.Append(Me.SectionRow(editing))
+        Dim keys As Array Of String = ["c:left", "c:leftAnchor", "c:relation", "c:right", "c:rightAnchor", "c:offset", "c:priority"]
+        Dim labels As Array Of String = ["Item", "Attribute", "Relation", "Target", "Target attribute", "Constant", "Priority"]
+        Dim details As Array Of String = ["The constrained control.", "The constrained edge or dimension.", "Equal, at most or at least.", "Another control, the safe area or a constant.", "The target edge or dimension.", "Offset in points added to the target (or the constant).", "Lower priorities may break to satisfy others."]
+        For i As Integer = 0 To Array.Count(keys) - 1
+            Dim row As LayoutInspectorRow = Me.NewRow("cfield", keys(i), labels(i), editing)
+            row.Height = Me.InspectorControlHeight() + 6
+            row.Detail = details(i)
+            rows.Append(row)
+        Next
+        Dim buttons As LayoutInspectorRow = Me.NewRow("cbuttons", "c:buttons", "Actions", editing)
+        buttons.Height = 42
+        If Me.mConstraintIndex > 0 Then
+            buttons.Commands = ["Update", "Delete"]
+            buttons.CommandEnabled = [True, True]
+        Else
+            buttons.Commands = ["Add", "Delete"]
+            buttons.CommandEnabled = [True, False]
+        End If
+        rows.Append(buttons)
+        Me.mAllRows = rows
+        Me.ApplyRowFilterNoFilter()
+    End Sub
+
+    Private Function FormatConstraint(data As JSONItem) As String
+        Dim leftName As String = Me.ConstraintNodeName(data.Value("leftNodeId").AsString().Or(""))
+        Dim leftAnchor As String = LayoutInspectorKit.ShortAnchor(data.Value("leftAnchor").AsString().Or(""))
+        Dim relation As String = data.Value("relation").AsString().Or("=")
+        If relation = "<=" Then relation = "≤"
+        If relation = ">=" Then relation = "≥"
+        Dim rightId As String = data.Value("rightNodeId").AsString().Or("")
+        Dim offset As Double = data.Value("offset").AsNumber().Or(0.0)
+        Dim text As String = leftName + "." + leftAnchor + " " + relation + " "
+        If rightId = "" Then Return text + LayoutInspectorKit.FormatNumber(offset)
+        text += Me.ConstraintNodeName(rightId) + "." + LayoutInspectorKit.ShortAnchor(data.Value("rightAnchor").AsString().Or(""))
+        If offset > 0.0 Then text += " + " + LayoutInspectorKit.FormatNumber(offset)
+        If offset < 0.0 Then text += " − " + LayoutInspectorKit.FormatNumber(-offset)
+        Return text
+    End Function
+
+    Private Function ConstraintNodeName(id As String) As String
+        If id = "safearea" Then Return "SafeArea"
+        If Me.mDocument = Nil Or id = "" Then Return id
+        Dim node As LayoutNode = Me.mDocument.FindNode(id)
+        If node = Nil Then Return id
+        Return node.Name
+    End Function
+
+    ''' Selects a constraint for editing: 0 is a new constraint, n is the nth
+    ''' entry of Constraints().
+    Public Sub ShowConstraintAt(index As Integer)
+        Dim anchors As Array Of String = LayoutInspectorKit.ConstraintAnchors()
+        If index < 0 Or index >= Array.Count(Me.mConstraintIds) Then index = 0
+        Me.mConstraintIndex = index
+        If Me.mMode = "constraints" And Me.ConstraintsSupported Then
+            Me.BuildConstraintRows()
+            Me.mActiveKey = "constraint:" + String.From(index)
+        End If
+        If index = 0 Then
+            If Me.mConstraintLeftNode.Count > 0 Then Me.mConstraintLeftNode.SelectedIndex = 0
+            If Me.mConstraintLeftAnchor.Count > 0 Then Me.mConstraintLeftAnchor.SelectedIndex = 0
+            If Me.mConstraintRelation.Count > 0 Then Me.mConstraintRelation.SelectedIndex = 0
+            If Me.mConstraintRightNode.Count > 0 Then Me.mConstraintRightNode.SelectedIndex = 0
+            If Me.mConstraintRightAnchor.Count > 0 Then Me.mConstraintRightAnchor.SelectedIndex = 0
+            Me.mConstraintOffset.Text = "0"
+            If Me.mConstraintPriority.Count > 0 Then Me.mConstraintPriority.SelectedIndex = 0
+            Me.InspectorRowsChanged()
+            Return
+        End If
+        Dim constraints As JSONItem = Me.Constraints()
+        Dim dataIndex As Integer = index - 1
+        If dataIndex < 0 Or dataIndex >= constraints.Count() Then
+            Me.InspectorRowsChanged()
+            Return
+        End If
+        Dim data As JSONItem = constraints.ValueAt(dataIndex)
+        Dim leftId As String = data.Value("leftNodeId").AsString().Or("")
+        For i As Integer = 0 To Array.Count(Me.mConstraintNodeIds) - 1
+            If Me.mConstraintNodeIds(i) = leftId Then Me.mConstraintLeftNode.SelectedIndex = i
+        Next
+        Dim anchorIndex As Integer = LayoutInspectorKit.IndexOfText(anchors, data.Value("leftAnchor").AsString().Or(""))
+        If anchorIndex >= 0 Then Me.mConstraintLeftAnchor.SelectedIndex = anchorIndex
+        Dim relIndex As Integer = LayoutInspectorKit.IndexOfText(["=", "<=", ">="], data.Value("relation").AsString().Or("="))
+        If relIndex >= 0 Then Me.mConstraintRelation.SelectedIndex = relIndex
+        Dim rightId As String = data.Value("rightNodeId").AsString().Or("")
+        Dim nodeCount As Integer = Array.Count(Me.mConstraintNodeIds)
+        If rightId = "safearea" Then
+            Me.mConstraintRightNode.SelectedIndex = nodeCount
+        ElseIf rightId = "" Then
+            Me.mConstraintRightNode.SelectedIndex = nodeCount + 1
+        Else
+            For i As Integer = 0 To nodeCount - 1
+                If Me.mConstraintNodeIds(i) = rightId Then Me.mConstraintRightNode.SelectedIndex = i
+            Next
+        End If
+        Dim rAnchorIndex As Integer = LayoutInspectorKit.IndexOfText(anchors, data.Value("rightAnchor").AsString().Or(""))
+        If rAnchorIndex >= 0 Then Me.mConstraintRightAnchor.SelectedIndex = rAnchorIndex
+        Dim offsetNum As Integer = Math.Round(data.Value("offset").AsNumber().Or(0.0))
+        Me.mConstraintOffset.Text = String.From(offsetNum)
+        Dim priIndex As Integer = LayoutInspectorKit.IndexOfText(["Required", "High", "Medium", "Low"], data.Value("priority").AsString().Or("Required"))
+        If priIndex >= 0 Then Me.mConstraintPriority.SelectedIndex = priIndex
+        Me.InspectorRowsChanged()
+    End Sub
+
+    Private Sub ApplyConstraintFromFields()
+        If Me.mDocument = Nil Or Me.mHost = Nil Or Me.mActiveRoot = "" Then Return
+        Dim constraintId As String = ""
+        If Me.mConstraintIndex > 0 And Me.mConstraintIndex < Array.Count(Me.mConstraintIds) Then constraintId = Me.mConstraintIds(Me.mConstraintIndex)
+        Dim leftIndex As Integer = Me.mConstraintLeftNode.SelectedIndex
+        If leftIndex < 0 Or leftIndex >= Array.Count(Me.mConstraintNodeIds) Then
+            Me.Status("Select a control to constrain.")
+            Return
+        End If
+        Dim leftNodeId As String = Me.mConstraintNodeIds(leftIndex)
+        Dim anchors As Array Of String = LayoutInspectorKit.ConstraintAnchors()
+        Dim leftAnchorIndex As Integer = Me.mConstraintLeftAnchor.SelectedIndex
+        If leftAnchorIndex < 0 Or leftAnchorIndex >= Array.Count(anchors) Then
+            Me.Status("Select an attribute.")
+            Return
+        End If
+        Dim leftAnchor As String = anchors(leftAnchorIndex)
+        Dim relations As Array Of String = ["=", "<=", ">="]
+        Dim relationIndex As Integer = Me.mConstraintRelation.SelectedIndex
+        If relationIndex < 0 Or relationIndex >= 3 Then relationIndex = 0
+        Dim relation As String = relations(relationIndex)
+        Dim rightIndex As Integer = Me.mConstraintRightNode.SelectedIndex
+        Dim rightNodeId As String = ""
+        Dim rightAnchor As String = ""
+        Dim nodeCount As Integer = Array.Count(Me.mConstraintNodeIds)
+        If rightIndex >= 0 And rightIndex < nodeCount Then
+            rightNodeId = Me.mConstraintNodeIds(rightIndex)
+        ElseIf rightIndex = nodeCount Then
+            rightNodeId = "safearea"
+        End If
+        If rightNodeId <> "" Then
+            Dim rightAnchorIndex As Integer = Me.mConstraintRightAnchor.SelectedIndex
+            If rightAnchorIndex >= 0 And rightAnchorIndex < Array.Count(anchors) Then rightAnchor = anchors(rightAnchorIndex)
+        End If
+        Dim offsetResult As Result Of Integer, String = Integer.Parse(String.Trim(Me.mConstraintOffset.Text))
+        If offsetResult.IsErr Then
+            Me.Status("Constant must be a whole number.")
+            Return
+        End If
+        Dim priorities As Array Of String = ["Required", "High", "Medium", "Low"]
+        Dim priorityIndex As Integer = Me.mConstraintPriority.SelectedIndex
+        Dim priority As String = "Required"
+        If priorityIndex >= 0 And priorityIndex < Array.Count(priorities) Then priority = priorities(priorityIndex)
+        If constraintId = "" Then
+            Me.AddConstraint(leftNodeId, leftAnchor, relation, rightNodeId, rightAnchor, offsetResult.Value, priority)
+        Else
+            Me.EditConstraint(constraintId, leftNodeId, leftAnchor, relation, rightNodeId, rightAnchor, offsetResult.Value, priority)
+        End If
+    End Sub
+
+    Private Sub DeleteConstraintFromField()
+        If Me.mConstraintIndex <= 0 Or Me.mConstraintIndex >= Array.Count(Me.mConstraintIds) Then Return
+        Dim id As String = Me.mConstraintIds(Me.mConstraintIndex)
+        Me.mConstraintIndex = 0
+        Me.DeleteConstraint(id)
+    End Sub
+
+    Private Function InspectorRowHeight() As Integer
+        #If TargetLinux Then
+            Return 26
+        #Else
+            Return 24
+        #End If
+    End Function
+
+    ''' Native single-line control height (GTK entries and drop-downs are taller).
+    Private Function InspectorControlHeight() As Integer
+        #If TargetLinux Then
+            Return 34
+        #ElseIf TargetWindows Then
+            Return 24
+        #Else
+            Return 22
+        #End If
+    End Function
+End Class
+
+''' Text, colour and glyph helpers shared by the inspector fragment.
+Private Class LayoutInspectorKit
+
+    ''' Case-sensitive equality (the = operator folds ASCII case).
+    Public Shared Function SameText(a As String, b As String) As Boolean
+        Return String.Compare(a, b, True) = 0
+    End Function
+
+    Public Shared Function IndexOfText(values As Array Of String, value As String) As Integer
+        For i As Integer = 0 To Array.Count(values) - 1
+            If LayoutInspectorKit.SameText(values(i), value) Then Return i
+        Next
+        Return -1
+    End Function
+
+    Public Shared Function FrameComponent(node As LayoutNode, index As Integer) As Integer
+        Select Case index
+            Case 0
+                Return node.X
+            Case 1
+                Return node.Y
+            Case 2
+                Return node.Width
+        End Select
+        Return node.Height
+    End Function
+
+    Public Shared Function ClassifyLiteral(rawValue As String, descriptor As LayoutPropertyDescriptor) As String
+        If descriptor <> Nil Then
+            If Array.Count(descriptor.Options) > 0 Then
+                Dim found As Boolean = False
+                For Each optionValue As String In descriptor.Options
+                    If LayoutInspectorKit.SameText(optionValue, rawValue) Then found = True
+                Next
+                If Not found Then Return "readonly"
+                If Not descriptor.ValidateExpression(rawValue) Then Return "readonly"
+                Return "enum"
+            End If
+            If Not descriptor.ValidateExpression(rawValue) Then Return "readonly"
+        End If
+        Dim raw As String = String.Trim(rawValue)
+        If LayoutInspectorKit.SameText(raw, "True") Or LayoutInspectorKit.SameText(raw, "False") Then Return "boolean"
+        If Integer.Parse(raw).IsOk Then Return "integer"
+        If Double.Parse(raw).IsOk Then
+            Dim numeric As New LayoutPropertyDescriptor("value", "double")
+            If numeric.ValidateExpression(raw) Then Return "double"
+            Return "readonly"
+        End If
+        Dim parsed As Optional Of JSONItem = Json.TryParse(raw)
+        If parsed.HasValue Then
+            If parsed.Value.IsString() Then Return "string"
+        End If
+        If descriptor = Nil And LayoutInspectorKit.IsQualifiedSymbol(raw) Then Return "raw"
+        Return "readonly"
+    End Function
+
+    Public Shared Function RangeText(row As LayoutInspectorRow) As String
+        If row.Minimum.HasValue And row.Maximum.HasValue Then Return "; range " + LayoutInspectorKit.FormatNumber(row.Minimum.Value) + "–" + LayoutInspectorKit.FormatNumber(row.Maximum.Value)
+        If row.Minimum.HasValue Then Return "; minimum " + LayoutInspectorKit.FormatNumber(row.Minimum.Value)
+        If row.Maximum.HasValue Then Return "; maximum " + LayoutInspectorKit.FormatNumber(row.Maximum.Value)
+        Return ""
+    End Function
+
+    Public Shared Function InspectorColor(name As String, dark As Boolean) As Color
+        If dark Then
+            Select Case name
+                Case "panel"
+                    Return Color.FromBytes(27, 32, 39)
+                Case "alt"
+                    Return Color.FromBytes(32, 38, 46)
+                Case "section"
+                    Return Color.FromBytes(38, 45, 54)
+                Case "line"
+                    Return Color.FromBytes(44, 51, 60)
+                Case "muted"
+                    Return Color.FromBytes(162, 172, 184)
+                Case "accent"
+                    Return Color.FromBytes(95, 208, 185)
+                Case "accentInk"
+                    Return Color.FromBytes(16, 32, 30)
+                Case "active"
+                    Return Color.RGBA(95.0 / 255.0, 208.0 / 255.0, 185.0 / 255.0, 0.16)
+                Case "field"
+                    Return Color.FromBytes(18, 22, 27)
+                Case "code"
+                    Return Color.FromBytes(196, 167, 255)
+                Case "hover"
+                    Return Color.RGBA(1.0, 1.0, 1.0, 0.06)
+            End Select
+            Return Color.FromBytes(228, 232, 237)
+        End If
+        Select Case name
+            Case "panel"
+                Return Color.FromBytes(251, 252, 253)
+            Case "alt"
+                Return Color.FromBytes(244, 246, 248)
+            Case "section"
+                Return Color.FromBytes(234, 238, 242)
+            Case "line"
+                Return Color.FromBytes(225, 229, 234)
+            Case "muted"
+                Return Color.FromBytes(91, 101, 115)
+            Case "accent"
+                Return Color.FromBytes(15, 118, 110)
+            Case "accentInk"
+                Return Color.White
+            Case "active"
+                Return Color.RGBA(15.0 / 255.0, 118.0 / 255.0, 110.0 / 255.0, 0.12)
+            Case "field"
+                Return Color.White
+            Case "code"
+                Return Color.FromBytes(111, 66, 193)
+            Case "hover"
+                Return Color.RGBA(0.0, 0.0, 0.0, 0.05)
+        End Select
+        Return Color.FromBytes(27, 33, 41)
+    End Function
+
+    Public Shared Function FitText(g As Graphics, text As String, font As String, size As Double, maxWidth As Double) As String
+        If maxWidth <= 6.0 Then Return ""
+        Dim value As String = text
+        If String.Contains(value, "\n") Then value = String.Replace(value, "\n", " ↵ ")
+        If String.Len(value) > 160 Then value = String.Left(value, 160)
+        If g.MeasureStringWidth(value, font, size) <= maxWidth Then Return value
+        Dim n As Integer = String.Len(value)
+        While n > 0
+            n -= 1
+            Dim candidate As String = String.Left(value, n) + "…"
+            If g.MeasureStringWidth(candidate, font, size) <= maxWidth Then Return candidate
+        Wend
+        Return ""
+    End Function
+
+    ''' Small vector glyphs for arrange commands (16pt box centred on cx, cy).
+    Public Shared Sub PaintCommandGlyph(g As Graphics, command As String, cx As Double, cy As Double, c As Color)
+        Dim x0 As Double = cx - 8.0
+        Dim y0 As Double = cy - 8.0
+        Select Case command
+            Case "align-left"
+                g.DrawLine(x0 + 1.5, y0, x0 + 1.5, y0 + 16.0, 1.5, c)
+                g.FillRect(x0 + 4.0, y0 + 3.0, 11.0, 4.0, c)
+                g.FillRect(x0 + 4.0, y0 + 9.0, 7.0, 4.0, c)
+            Case "align-hcenter"
+                g.DrawLine(cx, y0, cx, y0 + 16.0, 1.5, c)
+                g.FillRect(cx - 6.0, y0 + 3.0, 12.0, 4.0, c)
+                g.FillRect(cx - 4.0, y0 + 9.0, 8.0, 4.0, c)
+            Case "align-right"
+                g.DrawLine(x0 + 14.5, y0, x0 + 14.5, y0 + 16.0, 1.5, c)
+                g.FillRect(x0 + 1.0, y0 + 3.0, 11.0, 4.0, c)
+                g.FillRect(x0 + 5.0, y0 + 9.0, 7.0, 4.0, c)
+            Case "align-top"
+                g.DrawLine(x0, y0 + 1.5, x0 + 16.0, y0 + 1.5, 1.5, c)
+                g.FillRect(x0 + 3.0, y0 + 4.0, 4.0, 11.0, c)
+                g.FillRect(x0 + 9.0, y0 + 4.0, 4.0, 7.0, c)
+            Case "align-vcenter"
+                g.DrawLine(x0, cy, x0 + 16.0, cy, 1.5, c)
+                g.FillRect(x0 + 3.0, cy - 6.0, 4.0, 12.0, c)
+                g.FillRect(x0 + 9.0, cy - 4.0, 4.0, 8.0, c)
+            Case "align-bottom"
+                g.DrawLine(x0, y0 + 14.5, x0 + 16.0, y0 + 14.5, 1.5, c)
+                g.FillRect(x0 + 3.0, y0 + 1.0, 4.0, 11.0, c)
+                g.FillRect(x0 + 9.0, y0 + 5.0, 4.0, 7.0, c)
+            Case "distribute-hcenter"
+                g.FillRect(x0, y0 + 4.0, 3.0, 8.0, c)
+                g.FillRect(cx - 1.5, y0 + 2.0, 3.0, 12.0, c)
+                g.FillRect(x0 + 13.0, y0 + 4.0, 3.0, 8.0, c)
+                g.DrawLine(x0, y0 + 15.5, x0 + 16.0, y0 + 15.5, 1.0, c)
+            Case "distribute-vcenter"
+                g.FillRect(x0 + 4.0, y0, 8.0, 3.0, c)
+                g.FillRect(x0 + 2.0, cy - 1.5, 12.0, 3.0, c)
+                g.FillRect(x0 + 4.0, y0 + 13.0, 8.0, 3.0, c)
+                g.DrawLine(x0 + 15.5, y0, x0 + 15.5, y0 + 16.0, 1.0, c)
+            Case "space-horizontal-equal"
+                g.FillRect(x0, y0 + 2.0, 3.0, 12.0, c)
+                g.FillRect(x0 + 13.0, y0 + 2.0, 3.0, 12.0, c)
+                g.DrawLine(x0 + 4.0, cy, x0 + 12.0, cy, 1.2, c)
+                g.DrawLine(x0 + 4.0, cy, x0 + 6.5, cy - 2.5, 1.2, c)
+                g.DrawLine(x0 + 4.0, cy, x0 + 6.5, cy + 2.5, 1.2, c)
+                g.DrawLine(x0 + 12.0, cy, x0 + 9.5, cy - 2.5, 1.2, c)
+                g.DrawLine(x0 + 12.0, cy, x0 + 9.5, cy + 2.5, 1.2, c)
+            Case "space-vertical-equal"
+                g.FillRect(x0 + 2.0, y0, 12.0, 3.0, c)
+                g.FillRect(x0 + 2.0, y0 + 13.0, 12.0, 3.0, c)
+                g.DrawLine(cx, y0 + 4.0, cx, y0 + 12.0, 1.2, c)
+                g.DrawLine(cx, y0 + 4.0, cx - 2.5, y0 + 6.5, 1.2, c)
+                g.DrawLine(cx, y0 + 4.0, cx + 2.5, y0 + 6.5, 1.2, c)
+                g.DrawLine(cx, y0 + 12.0, cx - 2.5, y0 + 9.5, 1.2, c)
+                g.DrawLine(cx, y0 + 12.0, cx + 2.5, y0 + 9.5, 1.2, c)
+            Case "size-same-width"
+                g.StrokeRect(x0 + 2.5, y0 + 1.5, 11.0, 5.0, 1.2, c)
+                g.StrokeRect(x0 + 2.5, y0 + 9.5, 11.0, 5.0, 1.2, c)
+            Case "size-same-height"
+                g.StrokeRect(x0 + 1.5, y0 + 2.5, 5.0, 11.0, 1.2, c)
+                g.StrokeRect(x0 + 9.5, y0 + 2.5, 5.0, 11.0, 1.2, c)
+            Case "size-same-size"
+                g.StrokeRect(x0 + 0.5, y0 + 0.5, 9.0, 9.0, 1.2, c)
+                g.StrokeRect(x0 + 6.5, y0 + 6.5, 9.0, 9.0, 1.2, c)
+            Case "center-horizontally"
+                g.StrokeRect(x0 + 0.5, y0 + 0.5, 15.0, 15.0, 1.0, c)
+                g.FillRect(cx - 4.0, y0 + 5.0, 8.0, 6.0, c)
+                g.DrawLine(cx, y0 + 1.0, cx, y0 + 15.0, 1.0, c)
+            Case "center-vertically"
+                g.StrokeRect(x0 + 0.5, y0 + 0.5, 15.0, 15.0, 1.0, c)
+                g.FillRect(x0 + 5.0, cy - 4.0, 6.0, 8.0, c)
+                g.DrawLine(x0 + 1.0, cy, x0 + 15.0, cy, 1.0, c)
+            Case "bring-to-front"
+                g.StrokeRect(x0 + 0.5, y0 + 0.5, 9.0, 9.0, 1.2, c)
+                g.FillRect(x0 + 6.0, y0 + 6.0, 10.0, 10.0, c)
+            Case "send-to-back"
+                g.FillRect(x0, y0, 10.0, 10.0, c)
+                g.StrokeRect(x0 + 6.5, y0 + 6.5, 9.0, 9.0, 1.2, c)
+            Case "bring-forward"
+                g.FillRect(x0 + 1.0, y0 + 7.0, 9.0, 9.0, c)
+                g.DrawLine(x0 + 13.0, y0 + 1.0, x0 + 13.0, y0 + 9.0, 1.3, c)
+                g.DrawLine(x0 + 13.0, y0 + 1.0, x0 + 10.5, y0 + 3.5, 1.3, c)
+                g.DrawLine(x0 + 13.0, y0 + 1.0, x0 + 15.5, y0 + 3.5, 1.3, c)
+            Case "send-backward"
+                g.StrokeRect(x0 + 1.5, y0 + 7.5, 8.0, 8.0, 1.2, c)
+                g.DrawLine(x0 + 13.0, y0 + 1.0, x0 + 13.0, y0 + 9.0, 1.3, c)
+                g.DrawLine(x0 + 13.0, y0 + 9.0, x0 + 10.5, y0 + 6.5, 1.3, c)
+                g.DrawLine(x0 + 13.0, y0 + 9.0, x0 + 15.5, y0 + 6.5, 1.3, c)
+            Case Else
+                g.FillOval(cx - 2.0, cy - 2.0, 4.0, 4.0, c)
+        End Select
+    End Sub
+
+    Public Shared Function InspectorCommandTitle(command As String) As String
+        Select Case command
+            Case "align-left"
+                Return "Align left edges"
+            Case "align-hcenter"
+                Return "Align horizontal centres"
+            Case "align-right"
+                Return "Align right edges"
+            Case "align-top"
+                Return "Align top edges"
+            Case "align-vcenter"
+                Return "Align vertical centres"
+            Case "align-bottom"
+                Return "Align bottom edges"
+            Case "distribute-hcenter"
+                Return "Distribute horizontally"
+            Case "distribute-vcenter"
+                Return "Distribute vertically"
+            Case "space-horizontal-equal"
+                Return "Equal horizontal spacing"
+            Case "space-vertical-equal"
+                Return "Equal vertical spacing"
+            Case "size-same-width"
+                Return "Same width"
+            Case "size-same-height"
+                Return "Same height"
+            Case "size-same-size"
+                Return "Same size"
+            Case "center-horizontally"
+                Return "Centre horizontally in container"
+            Case "center-vertically"
+                Return "Centre vertically in container"
+            Case "bring-to-front"
+                Return "Bring to front"
+            Case "bring-forward"
+                Return "Bring forward"
+            Case "send-backward"
+                Return "Send backward"
+            Case "send-to-back"
+                Return "Send to back"
+        End Select
+        Return command
+    End Function
+
+    Public Shared Function ConstraintAnchors() As Array Of String
+        Return ["LeadingAnchor", "TrailingAnchor", "TopAnchor", "BottomAnchor", "CenterXAnchor", "CenterYAnchor", "WidthAnchor", "HeightAnchor", "BaselineAnchor"]
+    End Function
+
+    Public Shared Function ShortAnchor(anchor As String) As String
+        If String.EndsWith(anchor, "Anchor") Then Return String.Left(anchor, String.Len(anchor) - 6)
+        Return anchor
+    End Function
+
+    Public Shared Function InspectorMonoFont() As String
+        #If TargetMac Then
+            Return "Menlo"
+        #ElseIf TargetWindows Then
+            Return "Consolas"
+        #Else
+            Return "monospace"
+        #End If
+    End Function
+
+    Public Shared Function ShortSymbol(expression As String) As String
+        Dim parts As Array Of String = String.Split(expression, ".")
+        If Array.Count(parts) < 2 Then Return expression
+        Return Array.Last(parts)
+    End Function
+
+    Public Shared Function IsIdentifierText(text As String) As Boolean
+        If String.Len(text) = 0 Then Return False
+        Dim first As Boolean = True
+        For Each ch As String In String.Chars(text)
+            Dim code As Integer = String.Asc(ch)
+            Dim letter As Boolean = (code >= 65 And code <= 90) Or (code >= 97 And code <= 122) Or code = 95
+            Dim digit As Boolean = code >= 48 And code <= 57
+            If Not letter Then
+                If first Or Not digit Then Return False
+            End If
+            first = False
+        Next
+        Return True
+    End Function
+
+    Public Shared Function IsQualifiedSymbol(text As String) As Boolean
+        Dim segments As Array Of String = String.Split(text, ".")
+        If Array.Count(segments) < 2 Then Return False
+        For Each segment As String In segments
+            If Not LayoutInspectorKit.IsIdentifierText(segment) Then Return False
+        Next
+        Return True
+    End Function
+
+    Public Shared Function IsSimpleLiteral(raw As String) As Boolean
+        If LayoutInspectorKit.SameText(raw, "True") Or LayoutInspectorKit.SameText(raw, "False") Then Return True
+        If Double.Parse(raw).IsOk Then Return True
+        If String.Left(raw, 1) = "\"" Then
+            Dim parsed As Optional Of JSONItem = Json.TryParse(raw)
+            If parsed.HasValue Then Return parsed.Value.IsString()
+        End If
+        Return False
+    End Function
+
+    Public Shared Function DecodeStringLiteral(raw As String) As String
+        If String.Left(raw, 1) <> "\"" Then Return raw
+        Dim parsed As Optional Of JSONItem = Json.TryParse(raw)
+        If parsed.HasValue Then
+            If parsed.Value.IsString() Then Return parsed.Value.AsString().Or(raw)
+        End If
+        Return raw
+    End Function
+
+    ''' Buoy string literal: backslash escapes only (no doubled quotes).
+    Public Shared Function QuoteBuoyString(text As String) As String
+        Dim quoted As String = "\""
+        For Each ch As String In String.Chars(text)
+            Dim code As Integer = String.Asc(ch)
+            If code = 92 Then
+                quoted += "\\\\"
+            ElseIf code = 34 Then
+                quoted += "\\\""
+            ElseIf code = 10 Then
+                quoted += "\\n"
+            ElseIf code = 13 Then
+                quoted += "\\r"
+            ElseIf code = 9 Then
+                quoted += "\\t"
+            ElseIf code >= 32 Then
+                quoted += ch
+            End If
+        Next
+        Return quoted + "\""
+    End Function
+
+    Public Shared Function FormatNumber(value As Double) As String
+        If value = Math.Floor(value) And Math.Abs(value) < 1000000000000.0 Then
+            Dim whole As Integer = Math.Round(value)
+            Return String.From(whole)
+        End If
+        Return String.From(value)
+    End Function
+
+    ''' Recognises common colour expressions for a swatch; never evaluates code.
+    Public Shared Function ParseColorExpression(raw As String) As Optional Of Color
+        Select Case raw
+            Case "Color.Black"
+                Return Some(Color.Black)
+            Case "Color.White"
+                Return Some(Color.White)
+            Case "Color.Red"
+                Return Some(Color.Red)
+            Case "Color.Green"
+                Return Some(Color.Green)
+            Case "Color.Blue"
+                Return Some(Color.Blue)
+            Case "Color.Yellow"
+                Return Some(Color.Yellow)
+            Case "Color.Orange"
+                Return Some(Color.Orange)
+            Case "Color.Gray"
+                Return Some(Color.Gray)
+            Case "Color.Clear"
+                Return Some(Color.Clear)
+        End Select
+        Dim openAt As Integer = String.InStr(raw, "(")
+        If openAt <= 1 Or Not String.EndsWith(raw, ")") Then Return None
+        Dim name As String = String.Left(raw, openAt - 1)
+        If name <> "Color.RGB" And name <> "Color.RGBA" And name <> "Color.FromBytes" Then Return None
+        Dim inner As String = String.Mid(raw, openAt + 1, String.Len(raw) - openAt - 1)
+        Dim values As Array Of Double = []
+        For Each part As String In String.Split(inner, ",")
+            Dim parsed As Result Of Double, String = Double.Parse(String.Trim(part))
+            If parsed.IsErr Then Return None
+            values.Append(parsed.Value)
+        Next
+        If name = "Color.FromBytes" And Array.Count(values) = 3 Then Return Some(Color.FromBytes(Math.Round(values(0)), Math.Round(values(1)), Math.Round(values(2))))
+        If name = "Color.RGB" And Array.Count(values) = 3 Then Return Some(Color.RGB(values(0), values(1), values(2)))
+        If name = "Color.RGBA" And Array.Count(values) = 4 Then Return Some(Color.RGBA(values(0), values(1), values(2), values(3)))
+        Return None
+    End Function
+End Class

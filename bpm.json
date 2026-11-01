@@ -1,0 +1,28 @@
+{
+    "schema": 1,
+    "dependencies": {
+        "editorkit": {
+            "git": "https://github.com/BuoyBay/editorkit.git",
+            "rev": "refs/heads/main"
+        },
+        "layoutkit": {
+            "git": "https://github.com/BuoyBay/layoutkit.git",
+            "rev": "refs/heads/main"
+        },
+        "controlsnapshot": {
+            "git": "https://github.com/BuoyBay/controlsnapshot.git",
+            "rev": "refs/heads/main"
+        }
+    },
+    "files": [
+        "manifest.json",
+        "modules",
+        "resources",
+        "README.md",
+        "LICENSE",
+        "LICENSE-MIT.txt",
+        "LICENSE-APACHE.txt",
+        "LICENSE-DOCS.txt",
+        "NOTICE.md"
+    ]
+}

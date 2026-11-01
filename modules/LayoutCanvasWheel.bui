@@ -1,0 +1,217 @@
+' Native wheel delivery for custom-drawn controls. Pair OpenWheel after insertion
+' in a window with CloseWheel before native views are destroyed. Positive deltas
+' move the viewport down/right; pixels distinguishes trackpads from wheel lines.
+Public Class LayoutWheelCanvas Inherits Canvas
+    Private Property mWheelSlot As Integer = -1
+    Private Property mWheelWidget As Ptr = Nil
+    Private Property mWheelController As Ptr = Nil
+    Private Property mWheelDestroyHandler As UInt64 = 0
+    Public Property LastWheelError As String = ""
+
+    Public Function NativeWheel(dx As Double, dy As Double, pixels As Boolean) As Boolean
+        Return False
+    End Function
+
+    Public Sub OpenWheel()
+        If Me.mWheelSlot >= 0 Then Return
+        If Me.NativeWidget = Nil Then Return
+        Me.LastWheelError = ""
+        Me.mWheelSlot = Array.Count(LayoutWheelRegistry.Controls)
+        For i As Integer = 0 To Array.LastIndex(LayoutWheelRegistry.Controls)
+            If LayoutWheelRegistry.Controls(i) = Nil Then
+                Me.mWheelSlot = i
+                Exit For
+            End If
+        Next
+        If Me.mWheelSlot = Array.Count(LayoutWheelRegistry.Controls) Then
+            LayoutWheelRegistry.Controls.Append(Me)
+        Else
+            LayoutWheelRegistry.Controls(Me.mWheelSlot) = Me
+        End If
+        Me.mWheelWidget = Me.NativeWidget
+        Try
+            #If TargetLinux Then
+                Me.mWheelController = LayoutWheelScrollNew(3)
+                If Me.mWheelController = Nil Then Throw New RuntimeException("Could not create GTK wheel controller")
+                LayoutWheelConnect(Me.mWheelController, "scroll", AddressOf LayoutWheelGtkScroll, CType(Me.mWheelSlot + 1, Ptr), Nil, 0)
+                LayoutWheelAdd(Me.mWheelWidget, Me.mWheelController)
+                Me.mWheelDestroyHandler = LayoutWheelConnectDestroy(Me.mWheelWidget, "destroy", AddressOf LayoutWheelGtkDestroy, CType(Me.mWheelSlot + 1, Ptr), Nil, 0)
+            #ElseIf TargetWindows Then
+                Dim slot As UInt64 = Me.mWheelSlot + 1
+                If LayoutWheelSetSubclass(Me.mWheelWidget, AddressOf LayoutWheelWindows, 24768 + slot, slot) = 0 Then Throw New RuntimeException("Could not subclass wheel control")
+            #ElseIf TargetMac Then
+                LayoutWheelInstallMonitor()
+            #End If
+        Catch e As Exception
+            Me.LastWheelError = e.Message
+            Me.CloseWheel()
+        End Try
+    End Sub
+
+    Public Sub CloseWheel()
+        If Me.mWheelSlot < 0 Then Return
+        Try
+            #If TargetLinux Then
+                If Me.mWheelWidget <> Nil Then
+                    If Me.mWheelDestroyHandler <> 0 Then LayoutWheelDisconnect(Me.mWheelWidget, Me.mWheelDestroyHandler)
+                    If Me.mWheelController <> Nil Then LayoutWheelRemove(Me.mWheelWidget, Me.mWheelController)
+                End If
+            #ElseIf TargetWindows Then
+                Dim slot As UInt64 = Me.mWheelSlot + 1
+                If Me.mWheelWidget <> Nil Then LayoutWheelRemoveSubclass(Me.mWheelWidget, AddressOf LayoutWheelWindows, 24768 + slot)
+            #End If
+        Catch e As Exception
+            Me.LastWheelError = e.Message
+        End Try
+        Me.WheelWidgetDestroyed()
+        LayoutWheelRegistry.Controls(Me.mWheelSlot) = Nil
+        Me.mWheelSlot = -1
+        #If TargetMac Then
+            If LayoutWheelRegistry.Count() = 0 Then LayoutWheelUninstallMonitor()
+        #End If
+    End Sub
+
+    Public Sub WheelWidgetDestroyed()
+        Me.mWheelWidget = Nil
+        Me.mWheelController = Nil
+        Me.mWheelDestroyHandler = 0
+    End Sub
+
+    #If TargetMac Then
+    Public Function OwnsWheel(window As Ptr, point As LayoutWheelPoint) As Boolean
+        If Me.mWheelWidget = Nil Or window = Nil Or Not Me.Visible Then Return False
+        If LayoutWheelViewWindow(Me.mWheelWidget) <> window Then Return False
+        If LayoutWheelHidden(Me.mWheelWidget) Then Return False
+        Dim local As LayoutWheelPoint = LayoutWheelConvert(Me.mWheelWidget, point, Nil)
+        Return local.X >= 0 And local.Y >= 0 And local.X < Me.Width And local.Y < Me.Height
+    End Function
+    #End If
+End Class
+
+Private Class LayoutWheelRegistry
+    Public Shared Property Controls As Array Of LayoutWheelCanvas = []
+    Public Shared Property Monitor As Ptr = Nil
+    Public Shared Function Find(slot As Integer) As LayoutWheelCanvas
+        If slot < 0 Or slot >= Array.Count(LayoutWheelRegistry.Controls) Then Return Nil
+        Return LayoutWheelRegistry.Controls(slot)
+    End Function
+    Public Shared Function Count() As Integer
+        Dim count As Integer = 0
+        For Each control As LayoutWheelCanvas In LayoutWheelRegistry.Controls
+            If control <> Nil Then count += 1
+        Next
+        Return count
+    End Function
+End Class
+
+#If TargetLinux Then
+Delegate Function LayoutWheelScrollCallback(controller As Ptr, dx As Double, dy As Double, data As Ptr) As Int32
+Delegate Sub LayoutWheelDestroyCallback(widget As Ptr, data As Ptr)
+Private Optional Declare Function LayoutWheelScrollNew Lib "libgtk-4.so.1" Alias "gtk_event_controller_scroll_new" (wheelFlags As Int32) As Ptr
+Private Optional Declare Function LayoutWheelUnit Lib "libgtk-4.so.1" Alias "gtk_event_controller_scroll_get_unit" (controller As Ptr) As Int32
+Private Optional Declare Sub LayoutWheelAdd Lib "libgtk-4.so.1" Alias "gtk_widget_add_controller" (widget As Ptr, controller As Ptr)
+Private Optional Declare Sub LayoutWheelRemove Lib "libgtk-4.so.1" Alias "gtk_widget_remove_controller" (widget As Ptr, controller As Ptr)
+Private Optional Declare Function LayoutWheelConnect Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (instance As Ptr, signal As String, callback As LayoutWheelScrollCallback, data As Ptr, destroy As Ptr, wheelFlags As Int32) As UInt64
+Private Optional Declare Function LayoutWheelConnectDestroy Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (instance As Ptr, signal As String, callback As LayoutWheelDestroyCallback, data As Ptr, destroy As Ptr, wheelFlags As Int32) As UInt64
+Private Optional Declare Sub LayoutWheelDisconnect Lib "libgobject-2.0.so.0" Alias "g_signal_handler_disconnect" (instance As Ptr, identifier As UInt64)
+Sub LayoutWheelGtkDestroy(widget As Ptr, data As Ptr)
+    Dim control As LayoutWheelCanvas = LayoutWheelRegistry.Find(CType(data, Integer) - 1)
+    If control <> Nil Then control.WheelWidgetDestroyed()
+End Sub
+Function LayoutWheelGtkScroll(controller As Ptr, dx As Double, dy As Double, data As Ptr) As Int32
+    Dim control As LayoutWheelCanvas = LayoutWheelRegistry.Find(CType(data, Integer) - 1)
+    If control = Nil Then Return 0
+    Try
+        Dim pixels As Boolean = False
+        Try
+            pixels = LayoutWheelUnit(controller) = 1
+        Catch e As Exception
+            pixels = False
+        End Try
+        If control.NativeWheel(dx, dy, pixels) Then Return 1
+    Catch e As Exception
+        control.LastWheelError = e.Message
+    End Try
+    Return 0
+End Function
+#ElseIf TargetWindows Then
+Delegate Function LayoutWheelSubclass(window As Ptr, message As UInt32, word As UInt64, param As Int64, identifier As UInt64, data As UInt64) As Int64
+Private Optional Declare Function LayoutWheelSetSubclass Lib "comctl32" Alias "SetWindowSubclass" (window As Ptr, callback As LayoutWheelSubclass, identifier As UInt64, data As UInt64) As Int32
+Private Optional Declare Function LayoutWheelRemoveSubclass Lib "comctl32" Alias "RemoveWindowSubclass" (window As Ptr, callback As LayoutWheelSubclass, identifier As UInt64) As Int32
+Private Optional Declare Function LayoutWheelDefault Lib "comctl32" Alias "DefSubclassProc" (window As Ptr, message As UInt32, word As UInt64, param As Int64) As Int64
+Function LayoutWheelWindows(window As Ptr, message As UInt32, word As UInt64, param As Int64, identifier As UInt64, data As UInt64) As Int64
+    Dim slot As Integer = data
+    Dim control As LayoutWheelCanvas = LayoutWheelRegistry.Find(slot - 1)
+    If control = Nil Then Return LayoutWheelDefault(window, message, word, param)
+    Try
+        If message = 522 Or message = 526 Then
+            Dim raw As Integer = (word \ 65536) And 65535
+            If raw >= 32768 Then raw -= 65536
+            Dim delta As Double = raw / 120.0
+            If message = 522 Then
+                If control.NativeWheel(0.0, -delta, False) Then Return 0
+            Else
+                If control.NativeWheel(delta, 0.0, False) Then Return 0
+            End If
+        ElseIf message = 130 Then
+            LayoutWheelRemoveSubclass(window, AddressOf LayoutWheelWindows, identifier)
+            control.WheelWidgetDestroyed()
+        End If
+    Catch e As Exception
+        control.LastWheelError = e.Message
+    End Try
+    Return LayoutWheelDefault(window, message, word, param)
+End Function
+#ElseIf TargetMac Then
+Sequential Structure LayoutWheelPoint
+    X As Double
+    Y As Double
+End Structure
+Private Declare Function LayoutWheelClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+Private Declare Function LayoutWheelAddMonitor Lib "AppKit" Selector "addLocalMonitorForEventsMatchingMask:handler:" (cls As Ptr, mask As UInt64, handler As Block(Ptr) As Ptr) As Ptr
+Private Declare Sub LayoutWheelRemoveMonitor Lib "AppKit" Selector "removeMonitor:" (cls As Ptr, monitor As Ptr)
+Private Declare Function LayoutWheelRetain Lib "Foundation" Selector "retain" (value As Ptr) As Ptr
+Private Declare Sub LayoutWheelRelease Lib "Foundation" Selector "release" (value As Ptr)
+Private Declare Function LayoutWheelWindow Lib "AppKit" Selector "window" (nativeEvent As Ptr) As Ptr
+Private Declare Function LayoutWheelLocation Lib "AppKit" Selector "locationInWindow" (nativeEvent As Ptr) As LayoutWheelPoint
+Private Declare Function LayoutWheelConvert Lib "AppKit" Selector "convertPoint:fromView:" (view As Ptr, point As LayoutWheelPoint, source As Ptr) As LayoutWheelPoint
+Private Declare Function LayoutWheelViewWindow Lib "AppKit" Selector "window" (view As Ptr) As Ptr
+Private Declare Function LayoutWheelHidden Lib "AppKit" Selector "isHiddenOrHasHiddenAncestor" (view As Ptr) As Boolean
+Private Declare Function LayoutWheelDeltaX Lib "AppKit" Selector "scrollingDeltaX" (nativeEvent As Ptr) As Double
+Private Declare Function LayoutWheelDeltaY Lib "AppKit" Selector "scrollingDeltaY" (nativeEvent As Ptr) As Double
+Private Declare Function LayoutWheelPrecise Lib "AppKit" Selector "hasPreciseScrollingDeltas" (nativeEvent As Ptr) As Boolean
+Sub LayoutWheelInstallMonitor()
+    If LayoutWheelRegistry.Monitor <> Nil Then Return
+    Dim monitor As Ptr = LayoutWheelAddMonitor(LayoutWheelClass("NSEvent"), 4194304, Block(nativeEvent As Ptr) As Ptr
+        Return LayoutWheelMacEvent(nativeEvent)
+    End Block)
+    If monitor = Nil Then Throw New RuntimeException("Could not install wheel monitor")
+    LayoutWheelRegistry.Monitor = LayoutWheelRetain(monitor)
+End Sub
+Sub LayoutWheelUninstallMonitor()
+    Dim monitor As Ptr = LayoutWheelRegistry.Monitor
+    If monitor = Nil Then Return
+    LayoutWheelRegistry.Monitor = Nil
+    LayoutWheelRemoveMonitor(LayoutWheelClass("NSEvent"), monitor)
+    LayoutWheelRelease(monitor)
+End Sub
+Function LayoutWheelMacEvent(nativeEvent As Ptr) As Ptr
+    Dim active As LayoutWheelCanvas
+    Try
+        Dim window As Ptr = LayoutWheelWindow(nativeEvent)
+        If window = Nil Then Return nativeEvent
+        Dim point As LayoutWheelPoint = LayoutWheelLocation(nativeEvent)
+        For Each control As LayoutWheelCanvas In LayoutWheelRegistry.Controls
+            If control = Nil Then Continue For
+            If control.OwnsWheel(window, point) Then
+                active = control
+                If control.NativeWheel(-LayoutWheelDeltaX(nativeEvent), -LayoutWheelDeltaY(nativeEvent), LayoutWheelPrecise(nativeEvent)) Then Return Nil
+            End If
+        Next
+    Catch e As Exception
+        If active <> Nil Then active.LastWheelError = e.Message
+        ' Preserve native event propagation when a monitor callback fails.
+    End Try
+    Return nativeEvent
+End Function
+#End If
