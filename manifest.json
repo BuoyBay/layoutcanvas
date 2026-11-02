@@ -2,5 +2,5 @@
   "schema": 1,
   "name": "layoutcanvas",
   "version": "0.1.0",
-  "description": "Embed a View-based layout editor with Canvas inspector, palette and stage"
+  "description": "View-based layout editor \u2014 Canvas inspector, palette, stage"
 }

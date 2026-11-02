@@ -1,4 +1,4 @@
-# Embed a View-based layout editor with Canvas inspector, palette and stage
+# View-based layout editor — Canvas inspector, palette, stage
 
 A View-based native layout editor whose inspector, palette and stage surfaces inherit Canvas. `CanvasAppearance` defaults to `auto` and accepts `light` or `dark` for deterministic previews. Automatic appearance follows the OS and explicit GTK dark-theme selection. Builtin previews use contrasting text, field fills, borders and selection handles in both modes; package renderers receive `$appearance` alongside their typed values and `$expressions`. Constraint-controlled nested Views retain previews of their declared literal frames while direct dragging stays disabled; this is not a live constraint solver.
 
