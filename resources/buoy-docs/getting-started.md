@@ -15,7 +15,7 @@ The following complete program opens a source-preview surface. It deliberately a
 
 To enable edits, implement `LayoutEditorHost.CommitLayoutEdits(expectedVersion, edits)`, `LayoutSelectionChanged(nodeId)`, and `LayoutStatus(message)`. In the commit callback, reject stale revisions, update the authoritative EditorKit document once, and reload a new snapshot. A rejected proposal leaves source unchanged.
 
-```buoy
+```basic
 Import layoutcanvas
 Import layoutkit.LayoutDocument
 
@@ -40,7 +40,7 @@ End Sub
 
 To connect an application menu or toolbar, use the command dispatcher and optional host observer described in [Menus and toolbars](api.md#menus-and-toolbars). Keep enabled and checked state in sync through the observer; route activation through `PerformCommand` so the same editor validation and host transaction path handles both menu and canvas actions.
 
-In a workspace checkout, `tests/layoutcanvas_interaction_test.bui` provides a complete `ApplyHost` implementation with an authoritative `EditorDocument`, version checks, synchronous snapshot reload, project refactor callbacks, and command-state notifications. Its rejection cases illustrate why a host must return False when a proposal was not accepted. This repository test is not included in the installed package.
+An `ApplyHost` implementation owns the authoritative document, validates revisions and applies accepted proposals synchronously. Return False when a proposal is rejected; never report an unapplied edit as accepted.
 
 Register trusted extensions before loading source. Use `RefreshCatalog()` after catalog changes. Custom property Views should implement the reusable LayoutKit contract and replace old callback hosts on rebind. Unsupported or throwing factories fall back to available nonvisual/generic editors; they do not authorize stale callbacks.
 

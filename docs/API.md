@@ -2,7 +2,7 @@
 
 `CanvasAppearance` defaults to `auto` and accepts `light` or `dark` for deterministic previews. Automatic appearance follows the OS and explicit GTK dark-theme selection. Builtin previews use contrasting text, field fills, borders and selection handles in both modes; package renderers receive `$appearance` alongside their typed values and `$expressions`. Constraint-controlled nested Views retain previews of their declared literal frames while direct dragging stays disabled; this is not a live constraint solver.
 
-The design canvas and inspector accept keyboard focus and expose selection, row values and control names through native accessibility metadata. Tab/Shift+Tab select design controls; arrow keys move the selection. Focus the inspector mode switch and use Left/Right or Space to change modes, then Return to enter its property list. The native macOS regression test checks actual first-responder transfer and AppKit key events; it does not exercise VoiceOver.
+The design canvas and inspector accept keyboard focus and expose selection, row values and control names through native accessibility metadata. Tab/Shift+Tab select design controls; arrow keys move the selection. Focus the inspector mode switch and use Left/Right or Space to change modes, then Return to enter its property list. Keyboard focus and native accessibility metadata must be evaluated in the actual host application.
 
 Navigator libraries can call `SelectPaletteType(canonicalTypeName)` to select a control in the tool palette. Selection cancels any old placement, clears a filter that hides the type, expands its section and scrolls it into view. Unknown types return False and leave the palette unchanged. Canonical identities include package-qualified names from discovery. Setting `InspectorMode = "palette"` still works and reveals the palette column.
 
@@ -54,10 +54,6 @@ If a native factory or reusable view throws, its binding expires and that factor
 
 [DesignerWidgets](https://github.com/BuoyBay/designerwidgets/blob/main/modules/DesignerWidgets.bui) demonstrates an independently packaged custom Canvas control, renderer and native two-button property editor. The [host demo](https://github.com/BuoyBay/layoutkit/blob/main/examples/layout_designer_demo.bui) explicitly registers builtins and DesignerWidgets, shows the editor, and provides Undo, Redo and “Mark saved (memory)” buttons. The latter only records an in-memory baseline; it writes no file.
 
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
-On this Linux development image, prepend `LD_LIBRARY_PATH=/tmp/buoy-chatui-jpeg8/build` to the test command to use the existing JPEG 8 compatibility library required by the installed Buoy runtime. This environment-specific path is not a package dependency or portable installation instruction.
-
-The native rendering regression test checks component pixels, enabled/font/size changes, exact Picture reuse and editor integration. Set `BUOY_LAYOUT_NATIVE_OUTPUT` to an existing directory to export the test's light/dark component PNGs. Cross-target checks validate syntax/types; native execution and image inspection are separate checks.
+Linux consumers using the installed Picture backend require a compatible JPEG ABI 8 runtime. Configure the native loader for its real installation directory when it is not on the standard system search path.
 
 On macOS 27.2, AppKit's off-screen light text-field drawing can omit the straight bezel edges while a visible native field draws the full border. This also reproduces in a standalone Swift/AppKit capture with Increase Contrast disabled; dark fields and search fields retain their full bezels. It is a remaining snapshot fidelity limitation, independent of selection and resize handles.
