@@ -2,5 +2,5 @@
   "schema": 1,
   "name": "layoutcanvas",
   "version": "0.1.0",
-  "description": "Reusable native layout canvas and inspector with host-owned source edits and undo"
+  "description": "Embed a View-based layout editor with Canvas inspector, palette and stage"
 }
